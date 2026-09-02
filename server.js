@@ -45,9 +45,8 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .filter(Boolean);
 
 function parseConnectionString(urlStr) {
-  if (!urlStr) {
+  if (!urlStr)
     throw new Error("parseConnectionString: empty connection string");
-  }
   let parsed;
   try {
     parsed = new URL(urlStr);
@@ -115,20 +114,19 @@ const branchNodes = BRANCHES_CONFIG.map((b) => {
 const CONFIG = {
   port: parseInt(process.env.PORT || "3000", 10),
   pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "2000", 10),
-  batchSize: parseInt(process.env.BATCH_SIZE || "200", 10),
+  batchSize: parseInt(process.env.BATCH_SIZE || "500", 10),
   encryptionKey: process.env.PAYLOAD_ENCRYPTION_KEY || null,
 };
 
 class PayloadCipher {
   static decrypt(cipherText, keyHex) {
-    if (!keyHex) return cipherText;
-    if (!cipherText) return null;
+    if (!keyHex || !cipherText) return cipherText;
 
     let parsed;
     try {
       parsed =
         typeof cipherText === "string" ? JSON.parse(cipherText) : cipherText;
-    } catch (err) {
+    } catch {
       return cipherText;
     }
 
@@ -160,7 +158,53 @@ class PayloadCipher {
   }
 }
 
-// Dynamic Trigger Generator with Composite PK Support
+// Global cache for PK metadata to prevent repeated schema queries during batch execution
+const tablePkCache = new Map();
+
+async function getTablePkColumns(node, tableName) {
+  const cacheKey = `${node.id}:${tableName}`;
+  if (tablePkCache.has(cacheKey)) return tablePkCache.get(cacheKey);
+
+  const db = node.db;
+  const client = node.client;
+  let pkColumns = [];
+
+  const columnInfo = await db(tableName).columnInfo();
+  const columns = Object.keys(columnInfo);
+
+  if (columns.includes("record_id")) {
+    pkColumns = ["record_id"];
+  } else if (columns.includes("id")) {
+    pkColumns = ["id"];
+  } else {
+    if (client === "mysql2" || client === "mysql") {
+      const pkQuery = await db.raw(
+        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE 
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'`,
+        [tableName],
+      );
+      pkColumns = (pkQuery[0] || []).map((row) => row.COLUMN_NAME);
+    } else if (client === "pg" || client === "postgres") {
+      const pkQuery = await db.raw(
+        `SELECT a.attname 
+         FROM pg_index i 
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) 
+         WHERE i.indrelid = ?::regclass AND i.indisprimary`,
+        [tableName],
+      );
+      pkColumns = (pkQuery.rows || []).map((row) => row.attname);
+    }
+  }
+
+  if (pkColumns.length === 0 && columns.length > 0) {
+    pkColumns = [columns[0]];
+  }
+
+  tablePkCache.set(cacheKey, pkColumns);
+  return pkColumns;
+}
+
+// Complete Trigger Generator for INSERT, UPDATE, and DELETE operations
 async function setupNodeTriggers(node) {
   const db = node.db;
   const client = node.client;
@@ -174,85 +218,76 @@ async function setupNodeTriggers(node) {
       const columns = Object.keys(columnInfo);
       if (columns.length === 0) continue;
 
-      // Detect Primary Key dynamically (handles singular vs composite PKs)
-      let pkExpressingSql = "";
-      let pgPkExpressingSql = "";
-
-      if (columns.includes("record_id")) {
-        pkExpressingSql = "CAST(NEW.`record_id` AS CHAR)";
-        pgPkExpressingSql = "CAST(NEW.record_id AS VARCHAR)";
-      } else if (columns.includes("id")) {
-        pkExpressingSql = "CAST(NEW.`id` AS CHAR)";
-        pgPkExpressingSql = "CAST(NEW.id AS VARCHAR)";
-      } else {
-        // Fetch Primary Key constraint column names from DB metadata
-        let pkColumns = [];
-        if (client === "mysql2" || client === "mysql") {
-          const pkQuery = await db.raw(
-            `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE 
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'`,
-            [tableName],
-          );
-          pkColumns = (pkQuery[0] || []).map((row) => row.COLUMN_NAME);
-        } else if (client === "pg" || client === "postgres") {
-          const pkQuery = await db.raw(
-            `SELECT a.attname 
-             FROM pg_index i 
-             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) 
-             WHERE i.indrelid = ?::regclass AND i.indisprimary`,
-            [tableName],
-          );
-          pkColumns = (pkQuery.rows || []).map((row) => row.attname);
-        }
-
-        if (pkColumns.length > 0) {
-          pkExpressingSql = `CONCAT_WS('-', ${pkColumns.map((c) => `NEW.\`${c}\``).join(", ")})`;
-          pgPkExpressingSql = pkColumns
-            .map((c) => `NEW.${c}`)
-            .join(" || '-' || ");
-        } else {
-          // Fallback to first available column if no explicit PK constraint
-          pkExpressingSql = `CAST(NEW.\`${columns[0]}\` AS CHAR)`;
-          pgPkExpressingSql = `CAST(NEW.${columns[0]} AS VARCHAR)`;
-        }
-      }
+      const pkColumns = await getTablePkColumns(node, tableName);
 
       if (client === "mysql2" || client === "mysql") {
-        const jsonFields = columns
+        const pkNewSql = `CONCAT_WS('-', ${pkColumns.map((c) => `NEW.\`${c}\``).join(", ")})`;
+        const pkOldSql = `CONCAT_WS('-', ${pkColumns.map((c) => `OLD.\`${c}\``).join(", ")})`;
+
+        const jsonFieldsNew = columns
           .map((col) => `'${col}', NEW.\`${col}\``)
+          .join(", ");
+        const jsonFieldsOld = columns
+          .map((col) => `'${col}', OLD.\`${col}\``)
           .join(", ");
 
         const triggerSql = `
-          CREATE TRIGGER IF NOT EXISTS \`trg_${tableName}_ai\`
-          AFTER INSERT ON \`${tableName}\`
-          FOR EACH ROW
+          DROP TRIGGER IF EXISTS \`trg_${tableName}_ai\`;
+          DROP TRIGGER IF EXISTS \`trg_${tableName}_au\`;
+          DROP TRIGGER IF EXISTS \`trg_${tableName}_ad\`;
+
+          CREATE TRIGGER \`trg_${tableName}_ai\` AFTER INSERT ON \`${tableName}\` FOR EACH ROW
           BEGIN
             IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
               INSERT INTO \`sym_change_log\` (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
-              VALUES ('${tableName}', 'INSERT', ${pkExpressingSql}, JSON_OBJECT(${jsonFields}), '${node.id}', NOW());
+              VALUES ('${tableName}', 'INSERT', ${pkNewSql}, JSON_OBJECT(${jsonFieldsNew}), '${node.id}', NOW());
+            END IF;
+          END;
+
+          CREATE TRIGGER \`trg_${tableName}_au\` AFTER UPDATE ON \`${tableName}\` FOR EACH ROW
+          BEGIN
+            IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
+              INSERT INTO \`sym_change_log\` (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
+              VALUES ('${tableName}', 'UPDATE', ${pkNewSql}, JSON_OBJECT(${jsonFieldsNew}), '${node.id}', NOW());
+            END IF;
+          END;
+
+          CREATE TRIGGER \`trg_${tableName}_ad\` AFTER DELETE ON \`${tableName}\` FOR EACH ROW
+          BEGIN
+            IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
+              INSERT INTO \`sym_change_log\` (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
+              VALUES ('${tableName}', 'DELETE', ${pkOldSql}, JSON_OBJECT(${jsonFieldsOld}), '${node.id}', NOW());
             END IF;
           END;
         `;
 
         await db.raw(triggerSql);
       } else if (client === "pg" || client === "postgres") {
+        const pgPkNewSql = pkColumns.map((c) => `NEW.${c}`).join(" || '-' || ");
+        const pgPkOldSql = pkColumns.map((c) => `OLD.${c}`).join(" || '-' || ");
+
         const pgTriggerFunction = `
           CREATE OR REPLACE FUNCTION trg_${tableName}_sync() RETURNS TRIGGER AS $$
           BEGIN
             IF current_setting('sym.is_syncing', true) IS DISTINCT FROM 'true' THEN
-              INSERT INTO sym_change_log (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
-              VALUES ('${tableName}', TG_OP, ${pgPkExpressingSql}, row_to_json(NEW)::text, '${node.id}', NOW());
+              IF (TG_OP = 'DELETE') THEN
+                INSERT INTO sym_change_log (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
+                VALUES ('${tableName}', TG_OP, ${pgPkOldSql}, row_to_json(OLD)::text, '${node.id}', NOW());
+              ELSE
+                INSERT INTO sym_change_log (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
+                VALUES ('${tableName}', TG_OP, ${pgPkNewSql}, row_to_json(NEW)::text, '${node.id}', NOW());
+              END IF;
             END IF;
-            RETURN NEW;
+            RETURN COALESCE(NEW, OLD);
           END;
           $$ LANGUAGE plpgsql;
         `;
 
         await db.raw(pgTriggerFunction);
         await db.raw(`
-          DROP TRIGGER IF EXISTS trg_${tableName}_ai ON "${tableName}";
-          CREATE TRIGGER trg_${tableName}_ai
-          AFTER INSERT ON "${tableName}"
+          DROP TRIGGER IF EXISTS trg_${tableName}_sync ON "${tableName}";
+          CREATE TRIGGER trg_${tableName}_sync
+          AFTER INSERT OR UPDATE OR DELETE ON "${tableName}"
           FOR EACH ROW EXECUTE FUNCTION trg_${tableName}_sync();
         `);
       }
@@ -264,23 +299,20 @@ async function setupNodeTriggers(node) {
   }
 }
 
-// System Tables, Indexes & Triggers Provisioning
 async function provisionNode(node) {
   const db = node.db;
   const client = node.client;
 
-  // 1. Enable function/trigger creation privileges dynamically on MySQL/MariaDB node
   if (client === "mysql2" || client === "mysql") {
     try {
       await db.raw("SET GLOBAL log_bin_trust_function_creators = 1;");
     } catch (err) {
-      logger.warn(
-        `[Provision] Could not set log_bin_trust_function_creators on ${node.id}: ${err.message}`,
+      logger.debug(
+        `[Provision] Skip setting log_bin_trust_function_creators on ${node.id}: ${err.message}`,
       );
     }
   }
 
-  // 2. Ensure system tables exist
   const hasChangeLog = await db.schema.hasTable("sym_change_log");
   if (!hasChangeLog) {
     await db.schema.createTable("sym_change_log", (table) => {
@@ -303,7 +335,6 @@ async function provisionNode(node) {
     });
   }
 
-  // 3. Ensure indexes exist
   if (client === "pg" || client === "postgres") {
     await db.raw(
       "CREATE INDEX IF NOT EXISTS idx_sym_log_sync_poll ON sym_change_log (change_id ASC, node_source_id);",
@@ -321,7 +352,6 @@ async function provisionNode(node) {
     }
   }
 
-  // 4. Provision Triggers for all allowed tables
   await setupNodeTriggers(node);
 }
 
@@ -341,6 +371,7 @@ class SyncWorker {
   constructor(source, target) {
     this.source = source;
     this.target = target;
+    this.isProcessing = false;
   }
 
   async getCheckpoint() {
@@ -360,13 +391,11 @@ class SyncWorker {
       .first();
 
     const initialCheckpoint = latestLog?.max_id ? BigInt(latestLog.max_id) : 0n;
-
     await this.setCheckpoint(initialCheckpoint);
 
     logger.info(
-      `[Auto-Init Checkpoint] Initialized ${this.source.id} -> ${this.target.id} at change_id: ${initialCheckpoint}`,
+      `[Checkpoint] Initialized ${this.source.id} -> ${this.target.id} at change_id: ${initialCheckpoint}`,
     );
-
     return initialCheckpoint;
   }
 
@@ -398,16 +427,6 @@ class SyncWorker {
     }
   }
 
-  collapseChanges(changes) {
-    const latestByKey = new Map();
-    for (const change of changes) {
-      if (!ALLOWED_TABLES.has(change.table_name)) continue;
-      const key = `${change.table_name}:${change.primary_key_val}`;
-      latestByKey.set(key, change);
-    }
-    return latestByKey.values();
-  }
-
   decodePayload(change) {
     let rawPayloadJson = change.row_data;
     if (CONFIG.encryptionKey) {
@@ -421,7 +440,7 @@ class SyncWorker {
     if (typeof rawPayloadJson === "string") {
       try {
         payload = JSON.parse(rawPayloadJson);
-      } catch (err) {
+      } catch {
         payload = rawPayloadJson;
       }
     } else {
@@ -432,107 +451,112 @@ class SyncWorker {
   }
 
   async applyTableChanges(trx, tableName, tableChanges) {
-    const pkColumn = "id";
+    const pkColumns = await getTablePkColumns(this.target, tableName);
 
-    const deletes = tableChanges.filter((c) => c.operation === "DELETE");
-    const upserts = tableChanges.filter((c) => c.operation !== "DELETE");
+    for (const change of tableChanges) {
+      const payload = this.decodePayload(change);
 
-    if (deletes.length > 0) {
-      const ids = deletes.map((c) => c.primary_key_val);
-      await trx(tableName).whereIn(pkColumn, ids).del();
-    }
+      if (change.operation === "DELETE") {
+        const deleteQuery = trx(tableName);
+        if (pkColumns.length === 1) {
+          deleteQuery.where(pkColumns[0], change.primary_key_val);
+        } else {
+          const pkVals = String(change.primary_key_val).split("-");
+          pkColumns.forEach((col, idx) => deleteQuery.where(col, pkVals[idx]));
+        }
+        await deleteQuery.del();
+      } else {
+        // Handle INSERT / UPDATE with Upsert logic (insert or update on duplicate key)
+        const matchQuery = trx(tableName);
+        if (pkColumns.length === 1) {
+          const val =
+            payload && payload[pkColumns[0]] !== undefined
+              ? payload[pkColumns[0]]
+              : change.primary_key_val;
+          matchQuery.where(pkColumns[0], val);
+        } else {
+          const pkVals = String(change.primary_key_val).split("-");
+          pkColumns.forEach((col, idx) => {
+            const val =
+              payload && payload[col] !== undefined
+                ? payload[col]
+                : pkVals[idx];
+            matchQuery.where(col, val);
+          });
+        }
 
-    if (upserts.length === 0) return;
+        const existingRecord = await matchQuery.first();
 
-    const decoded = upserts.map((change) => ({
-      pk: change.primary_key_val,
-      payload: this.decodePayload(change),
-    }));
-
-    const ids = decoded.map((d) => d.pk);
-    const existingRows = await trx(tableName)
-      .whereIn(pkColumn, ids)
-      .select(pkColumn, "updated_at");
-    const existingByPk = new Map(
-      existingRows.map((row) => [String(row[pkColumn]), row]),
-    );
-
-    const toInsert = [];
-    const toUpdate = [];
-
-    for (const { pk, payload } of decoded) {
-      const existing = existingByPk.get(String(pk));
-      if (!existing) {
-        toInsert.push(payload);
-        continue;
+        if (!existingRecord) {
+          await trx(tableName).insert(payload);
+        } else {
+          const updateQuery = trx(tableName);
+          if (pkColumns.length === 1) {
+            updateQuery.where(pkColumns[0], existingRecord[pkColumns[0]]);
+          } else {
+            pkColumns.forEach((col) =>
+              updateQuery.where(col, existingRecord[col]),
+            );
+          }
+          await updateQuery.update(payload);
+        }
       }
-      const incomingTs =
-        payload && payload.updated_at
-          ? new Date(payload.updated_at).getTime()
-          : Date.now();
-      const existingTs = existing.updated_at
-        ? new Date(existing.updated_at).getTime()
-        : 0;
-      if (incomingTs >= existingTs) {
-        toUpdate.push({ pk, payload });
-      }
-    }
-
-    if (toInsert.length > 0) {
-      await trx(tableName).insert(toInsert);
-    }
-
-    for (const { pk, payload } of toUpdate) {
-      await trx(tableName).where(pkColumn, pk).update(payload);
     }
   }
 
   async processBatch() {
-    const lastId = await this.getCheckpoint();
+    if (this.isProcessing) return false;
+    this.isProcessing = true;
 
-    const changes = await this.source
-      .db("sym_change_log")
-      .select(
-        "change_id",
-        "table_name",
-        "operation",
-        "primary_key_val",
-        "row_data",
-        "node_source_id",
-      )
-      .where("change_id", ">", lastId.toString())
-      .whereNot("node_source_id", this.target.id)
-      .orderBy("change_id", "asc")
-      .limit(CONFIG.batchSize);
+    try {
+      const lastId = await this.getCheckpoint();
 
-    if (changes.length === 0) {
-      return false;
-    }
+      const changes = await this.source
+        .db("sym_change_log")
+        .select(
+          "change_id",
+          "table_name",
+          "operation",
+          "primary_key_val",
+          "row_data",
+          "node_source_id",
+        )
+        .where("change_id", ">", lastId.toString())
+        .whereNot("node_source_id", this.target.id)
+        .orderBy("change_id", "asc")
+        .limit(CONFIG.batchSize);
 
-    logger.info(
-      `[Sync Engine] ${this.source.id} -> ${this.target.id} | Processing ${changes.length} events...`,
-    );
-
-    const collapsed = [...this.collapseChanges(changes)];
-
-    const byTable = new Map();
-    for (const change of collapsed) {
-      if (!byTable.has(change.table_name)) byTable.set(change.table_name, []);
-      byTable.get(change.table_name).push(change);
-    }
-
-    await this.target.db.transaction(async (trx) => {
-      await this.setSessionBypass(trx);
-
-      for (const [tableName, tableChanges] of byTable) {
-        await this.applyTableChanges(trx, tableName, tableChanges);
+      if (changes.length === 0) {
+        return false;
       }
 
-      const lastBatchId = changes[changes.length - 1].change_id;
-      await this.setCheckpoint(lastBatchId, trx);
-    });
+      logger.info(
+        `[Sync Engine] ${this.source.id} -> ${this.target.id} | Processing ${changes.length} events...`,
+      );
 
-    return true;
+      // Group into strict sequential per-table execution order
+      const byTable = new Map();
+      for (const change of changes) {
+        if (!ALLOWED_TABLES.has(change.table_name)) continue;
+        if (!byTable.has(change.table_name)) byTable.set(change.table_name, []);
+        byTable.get(change.table_name).push(change);
+      }
+
+      await this.target.db.transaction(async (trx) => {
+        await this.setSessionBypass(trx);
+
+        for (const [tableName, tableChanges] of byTable) {
+          await this.applyTableChanges(trx, tableName, tableChanges);
+        }
+
+        const lastBatchId = changes[changes.length - 1].change_id;
+        await this.setCheckpoint(lastBatchId, trx);
+      });
+
+      return true;
+    } finally {
+      this.isProcessing = false;
+    }
   }
 }
 
@@ -602,12 +626,10 @@ async function startMultiBranchEngine() {
   try {
     logger.info(`Starting Hub-and-Spoke Engine for Hub [${HUB_NODE.id}]...`);
 
-    // 1. Provision Hub schema, global settings, and triggers
     await provisionNode(HUB_NODE);
 
     const workers = [];
 
-    // 2. Provision each branch node individually BEFORE starting the sync loop
     for (const branch of branchNodes) {
       try {
         await provisionNode(branch);
@@ -633,7 +655,6 @@ async function startMultiBranchEngine() {
       logger.info(`Hub Monitoring API active on port ${CONFIG.port}`);
     });
 
-    // 3. Main Engine Loop
     while (running) {
       const tasks = workers.flatMap((w) => [
         w.hubToBranch.processBatch().catch((err) => {
