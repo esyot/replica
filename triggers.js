@@ -1,14 +1,27 @@
 require("dotenv").config();
 const knex = require("knex");
 
-const ALLOWED_TABLES = new Set([
-  // Add your tables here
-  "card_transaction",
-]);
+// Parse ALLOWED_TABLES dynamically from environment variable
+const rawAllowedTables = process.env.ALLOWED_TABLES || "";
+const ALLOWED_TABLES = new Set(
+  rawAllowedTables
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean),
+);
+
+// Cache PK queries in memory per table to reduce DB schema lookup overhead
+const pkCache = new Map();
 
 async function getTablePkColumns(node, tableName) {
+  const cacheKey = `${node.id}:${tableName}`;
+  if (pkCache.has(cacheKey)) {
+    return pkCache.get(cacheKey);
+  }
+
   const db = node.db;
   const client = node.client;
+  let pkColumns = [];
 
   if (client === "pg" || client === "postgres") {
     const res = await db.raw(
@@ -18,19 +31,27 @@ async function getTablePkColumns(node, tableName) {
        WHERE i.indrelid = ?::regclass AND i.indisprimary;`,
       [tableName],
     );
-    return res.rows.map((r) => r.attname);
+    pkColumns = res.rows.map((r) => r.attname);
   } else {
     const res = await db.raw(`SHOW KEYS FROM ?? WHERE Key_name = 'PRIMARY'`, [
       tableName,
     ]);
     const rows = res[0] || res;
-    return rows.map((r) => r.Column_name);
+    pkColumns = rows.map((r) => r.Column_name);
   }
+
+  if (pkColumns.length > 0) {
+    pkCache.set(cacheKey, pkColumns);
+  }
+
+  return pkColumns;
 }
 
 async function setupNodeTriggers(node) {
-  // Your database trigger creation logic here...
-  console.log(`Setting up triggers on node: ${node.id}`);
+  console.log(
+    `Setting up triggers on node: ${node.id} for ${ALLOWED_TABLES.size} table(s)`,
+  );
+  // Add node database trigger generation/installation logic here if needed
 }
 
 module.exports = {
