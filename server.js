@@ -129,11 +129,9 @@ class PayloadCipher {
       parsed =
         typeof cipherText === "string" ? JSON.parse(cipherText) : cipherText;
     } catch (err) {
-      // If it's raw non-JSON text, return as-is
       return cipherText;
     }
 
-    // Check if the payload is unencrypted raw database row data (lacks AES-GCM properties)
     if (
       !parsed ||
       typeof parsed !== "object" ||
@@ -236,9 +234,10 @@ class SyncWorker {
     }
 
     // AUTOMATIC SNAPSHOT POINT INITIALIZATION
-    // If no checkpoint exists for this branch, initialize it at current MAX(change_id)
+    // Only count changes originated locally by this source node
     const latestLog = await this.source
       .db("sym_change_log")
+      .whereNot("node_source_id", this.target.id)
       .max("change_id as max_id")
       .first();
 
@@ -389,17 +388,6 @@ class SyncWorker {
       .limit(CONFIG.batchSize);
 
     if (changes.length === 0) {
-      const latestSourceLog = await this.source
-        .db("sym_change_log")
-        .max("change_id as max_id")
-        .first();
-
-      const maxId = latestSourceLog?.max_id
-        ? BigInt(latestSourceLog.max_id)
-        : 0n;
-      if (maxId > lastId) {
-        await this.setCheckpoint(maxId);
-      }
       return false;
     }
 
