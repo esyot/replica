@@ -6,7 +6,11 @@ const crypto = require("crypto");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 
-const { getTablePkColumns, ALLOWED_TABLES } = require("./triggers");
+const {
+  getTablePkColumns,
+  setupNodeTriggers,
+  ALLOWED_TABLES,
+} = require("./triggers");
 
 const logger = winston.createLogger({
   level: process.env.NODE_ENV === "production" ? "info" : "debug",
@@ -211,6 +215,9 @@ async function provisionNode(node) {
       if (!err.message.includes("Duplicate key name")) throw err;
     }
   }
+
+  // Ensure database triggers are present and up to date
+  await setupNodeTriggers(node);
 }
 
 function filterPayloadColumns(tableName, payload) {
@@ -381,6 +388,42 @@ class SyncWorker {
   }
 }
 
+async function flushPendingSyncs(workers) {
+  logger.info(
+    "[Startup Sync] Checking and draining pending backlog across all nodes...",
+  );
+  let pendingCount = 0;
+  let hasMoreData = true;
+
+  while (hasMoreData) {
+    const tasks = workers.flatMap((w) => [
+      w.hubToBranch.processBatch().catch((err) => {
+        logger.error(
+          `[Flush Error] ${w.branchId} hub->branch: ${err.stack || err.message}`,
+        );
+        return false;
+      }),
+      w.branchToHub.processBatch().catch((err) => {
+        logger.error(
+          `[Flush Error] ${w.branchId} branch->hub: ${err.stack || err.message}`,
+        );
+        return false;
+      }),
+    ]);
+
+    const results = await Promise.all(tasks);
+    hasMoreData = results.some((hasMore) => hasMore === true);
+
+    if (hasMoreData) {
+      pendingCount++;
+    }
+  }
+
+  logger.info(
+    `[Startup Sync] Flush complete. Flushed ${pendingCount} batches of pending changes. All nodes caught up!`,
+  );
+}
+
 const app = express();
 
 if (ALLOWED_ORIGINS.length > 0) {
@@ -472,6 +515,9 @@ async function startMultiBranchEngine() {
 
       logger.info(`Registered sync worker for branch: [${branch.id}]`);
     }
+
+    // Process all existing backlog immediately on restart
+    await flushPendingSyncs(workers);
 
     server = app.listen(CONFIG.port, () => {
       logger.info(`Hub Monitoring API active on port ${CONFIG.port}`);
