@@ -211,6 +211,8 @@ async function provisionNode(node) {
       if (!err.message.includes("Duplicate key name")) throw err;
     }
   }
+
+  // NOTE: setupNodeTriggers removed intentionally.
 }
 
 function filterPayloadColumns(tableName, payload) {
@@ -476,6 +478,7 @@ app.get("/health", requireApiKey, async (req, res) => {
 });
 
 let running = true;
+let isShuttingDown = false;
 let server;
 
 async function startMultiBranchEngine() {
@@ -545,11 +548,9 @@ async function startMultiBranchEngine() {
   }
 }
 
-let isShuttingDown = false;
-
-function shutdown(signal) {
+async function shutdown(signal) {
   if (isShuttingDown) {
-    logger.info("Forced exit requested.");
+    logger.info("Forced shutdown requested. Exiting now.");
     process.exit(1);
   }
 
@@ -557,14 +558,23 @@ function shutdown(signal) {
   logger.info(`Received ${signal}, shutting down gracefully...`);
   running = false;
 
+  setTimeout(() => {
+    logger.error("Forcefully shutting down due to timeout.");
+    process.exit(1);
+  }, 2000).unref();
+
   if (server) {
     server.close();
   }
 
-  setTimeout(() => {
-    logger.error("Timed out waiting for tasks, exiting now.");
-    process.exit(1);
-  }, 2000).unref();
+  try {
+    await HUB_NODE.db.destroy();
+    await Promise.all(branchNodes.map((b) => b.db.destroy()));
+  } catch (err) {
+    logger.error(`Error closing DB connections: ${err.message}`);
+  }
+
+  process.exit(0);
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
