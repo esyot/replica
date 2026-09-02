@@ -160,7 +160,7 @@ class PayloadCipher {
   }
 }
 
-// Dynamic Trigger Generator
+// Dynamic Trigger Generator with Composite PK Support
 async function setupNodeTriggers(node) {
   const db = node.db;
   const client = node.client;
@@ -172,10 +172,50 @@ async function setupNodeTriggers(node) {
 
       const columnInfo = await db(tableName).columnInfo();
       const columns = Object.keys(columnInfo);
-
       if (columns.length === 0) continue;
 
-      const pkCol = columns.includes("record_id") ? "record_id" : "id";
+      // Detect Primary Key dynamically (handles singular vs composite PKs)
+      let pkExpressingSql = "";
+      let pgPkExpressingSql = "";
+
+      if (columns.includes("record_id")) {
+        pkExpressingSql = "CAST(NEW.`record_id` AS CHAR)";
+        pgPkExpressingSql = "CAST(NEW.record_id AS VARCHAR)";
+      } else if (columns.includes("id")) {
+        pkExpressingSql = "CAST(NEW.`id` AS CHAR)";
+        pgPkExpressingSql = "CAST(NEW.id AS VARCHAR)";
+      } else {
+        // Fetch Primary Key constraint column names from DB metadata
+        let pkColumns = [];
+        if (client === "mysql2" || client === "mysql") {
+          const pkQuery = await db.raw(
+            `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE 
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'`,
+            [tableName],
+          );
+          pkColumns = (pkQuery[0] || []).map((row) => row.COLUMN_NAME);
+        } else if (client === "pg" || client === "postgres") {
+          const pkQuery = await db.raw(
+            `SELECT a.attname 
+             FROM pg_index i 
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) 
+             WHERE i.indrelid = ?::regclass AND i.indisprimary`,
+            [tableName],
+          );
+          pkColumns = (pkQuery.rows || []).map((row) => row.attname);
+        }
+
+        if (pkColumns.length > 0) {
+          pkExpressingSql = `CONCAT_WS('-', ${pkColumns.map((c) => `NEW.\`${c}\``).join(", ")})`;
+          pgPkExpressingSql = pkColumns
+            .map((c) => `NEW.${c}`)
+            .join(" || '-' || ");
+        } else {
+          // Fallback to first available column if no explicit PK constraint
+          pkExpressingSql = `CAST(NEW.\`${columns[0]}\` AS CHAR)`;
+          pgPkExpressingSql = `CAST(NEW.${columns[0]} AS VARCHAR)`;
+        }
+      }
 
       if (client === "mysql2" || client === "mysql") {
         const jsonFields = columns
@@ -189,7 +229,7 @@ async function setupNodeTriggers(node) {
           BEGIN
             IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
               INSERT INTO \`sym_change_log\` (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
-              VALUES ('${tableName}', 'INSERT', CAST(NEW.\`${pkCol}\` AS CHAR), JSON_OBJECT(${jsonFields}), '${node.id}', NOW());
+              VALUES ('${tableName}', 'INSERT', ${pkExpressingSql}, JSON_OBJECT(${jsonFields}), '${node.id}', NOW());
             END IF;
           END;
         `;
@@ -201,7 +241,7 @@ async function setupNodeTriggers(node) {
           BEGIN
             IF current_setting('sym.is_syncing', true) IS DISTINCT FROM 'true' THEN
               INSERT INTO sym_change_log (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
-              VALUES ('${tableName}', TG_OP, CAST(NEW.${pkCol} AS VARCHAR), row_to_json(NEW)::text, '${node.id}', NOW());
+              VALUES ('${tableName}', TG_OP, ${pgPkExpressingSql}, row_to_json(NEW)::text, '${node.id}', NOW());
             END IF;
             RETURN NEW;
           END;
