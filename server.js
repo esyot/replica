@@ -160,11 +160,87 @@ class PayloadCipher {
   }
 }
 
-// System Tables & Indexes Provisioning
+// Dynamic Trigger Generator
+async function setupNodeTriggers(node) {
+  const db = node.db;
+  const client = node.client;
+
+  for (const tableName of ALLOWED_TABLES) {
+    try {
+      const hasTable = await db.schema.hasTable(tableName);
+      if (!hasTable) continue;
+
+      const columnInfo = await db(tableName).columnInfo();
+      const columns = Object.keys(columnInfo);
+
+      if (columns.length === 0) continue;
+
+      const pkCol = columns.includes("record_id") ? "record_id" : "id";
+
+      if (client === "mysql2" || client === "mysql") {
+        const jsonFields = columns
+          .map((col) => `'${col}', NEW.\`${col}\``)
+          .join(", ");
+
+        const triggerSql = `
+          CREATE TRIGGER IF NOT EXISTS \`trg_${tableName}_ai\`
+          AFTER INSERT ON \`${tableName}\`
+          FOR EACH ROW
+          BEGIN
+            IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
+              INSERT INTO \`sym_change_log\` (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
+              VALUES ('${tableName}', 'INSERT', CAST(NEW.\`${pkCol}\` AS CHAR), JSON_OBJECT(${jsonFields}), '${node.id}', NOW());
+            END IF;
+          END;
+        `;
+
+        await db.raw(triggerSql);
+      } else if (client === "pg" || client === "postgres") {
+        const pgTriggerFunction = `
+          CREATE OR REPLACE FUNCTION trg_${tableName}_sync() RETURNS TRIGGER AS $$
+          BEGIN
+            IF current_setting('sym.is_syncing', true) IS DISTINCT FROM 'true' THEN
+              INSERT INTO sym_change_log (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
+              VALUES ('${tableName}', TG_OP, CAST(NEW.${pkCol} AS VARCHAR), row_to_json(NEW)::text, '${node.id}', NOW());
+            END IF;
+            RETURN NEW;
+          END;
+          $$ LANGUAGE plpgsql;
+        `;
+
+        await db.raw(pgTriggerFunction);
+        await db.raw(`
+          DROP TRIGGER IF EXISTS trg_${tableName}_ai ON "${tableName}";
+          CREATE TRIGGER trg_${tableName}_ai
+          AFTER INSERT ON "${tableName}"
+          FOR EACH ROW EXECUTE FUNCTION trg_${tableName}_sync();
+        `);
+      }
+    } catch (err) {
+      logger.error(
+        `[Trigger Error] Node [${node.id}] Table [${tableName}]: ${err.message}`,
+      );
+    }
+  }
+}
+
+// System Tables, Indexes & Triggers Provisioning
 async function provisionNode(node) {
   const db = node.db;
   const client = node.client;
 
+  // 1. Enable function/trigger creation privileges dynamically on MySQL/MariaDB node
+  if (client === "mysql2" || client === "mysql") {
+    try {
+      await db.raw("SET GLOBAL log_bin_trust_function_creators = 1;");
+    } catch (err) {
+      logger.warn(
+        `[Provision] Could not set log_bin_trust_function_creators on ${node.id}: ${err.message}`,
+      );
+    }
+  }
+
+  // 2. Ensure system tables exist
   const hasChangeLog = await db.schema.hasTable("sym_change_log");
   if (!hasChangeLog) {
     await db.schema.createTable("sym_change_log", (table) => {
@@ -187,6 +263,7 @@ async function provisionNode(node) {
     });
   }
 
+  // 3. Ensure indexes exist
   if (client === "pg" || client === "postgres") {
     await db.raw(
       "CREATE INDEX IF NOT EXISTS idx_sym_log_sync_poll ON sym_change_log (change_id ASC, node_source_id);",
@@ -203,6 +280,9 @@ async function provisionNode(node) {
       if (!err.message.includes("Duplicate key name")) throw err;
     }
   }
+
+  // 4. Provision Triggers for all allowed tables
+  await setupNodeTriggers(node);
 }
 
 function filterPayloadColumns(tableName, payload) {
@@ -233,8 +313,6 @@ class SyncWorker {
       return BigInt(record.last_processed_change_id);
     }
 
-    // AUTOMATIC SNAPSHOT POINT INITIALIZATION
-    // Only count changes originated locally by this source node
     const latestLog = await this.source
       .db("sym_change_log")
       .whereNot("node_source_id", this.target.id)
@@ -484,17 +562,17 @@ async function startMultiBranchEngine() {
   try {
     logger.info(`Starting Hub-and-Spoke Engine for Hub [${HUB_NODE.id}]...`);
 
-    // 1. Provision Hub schema first
+    // 1. Provision Hub schema, global settings, and triggers
     await provisionNode(HUB_NODE);
 
     const workers = [];
 
-    // 2. Ensure all branch schemas are provisioned BEFORE starting the sync loop
+    // 2. Provision each branch node individually BEFORE starting the sync loop
     for (const branch of branchNodes) {
       try {
         await provisionNode(branch);
         logger.info(
-          `[Startup] Provisioned/Verified schema for branch: [${branch.id}]`,
+          `[Startup] Provisioned schema, settings, and triggers for branch: [${branch.id}]`,
         );
       } catch (err) {
         logger.warn(
@@ -515,7 +593,7 @@ async function startMultiBranchEngine() {
       logger.info(`Hub Monitoring API active on port ${CONFIG.port}`);
     });
 
-    // 3. Main Engine Loop: Runs sync tasks for all branches in parallel
+    // 3. Main Engine Loop
     while (running) {
       const tasks = workers.flatMap((w) => [
         w.hubToBranch.processBatch().catch((err) => {
