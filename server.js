@@ -121,6 +121,7 @@ const CONFIG = {
   pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "2000", 10),
   batchSize: parseInt(process.env.BATCH_SIZE || "500", 10),
   encryptionKey: process.env.PAYLOAD_ENCRYPTION_KEY || null,
+  setupTriggersOnStartup: process.env.SETUP_TRIGGERS_ON_STARTUP === "true",
 };
 
 class PayloadCipher {
@@ -216,8 +217,13 @@ async function provisionNode(node) {
     }
   }
 
-  // Ensure database triggers are present and up to date
-  await setupNodeTriggers(node);
+  if (CONFIG.setupTriggersOnStartup) {
+    await setupNodeTriggers(node);
+  } else {
+    logger.info(
+      `[Provision] Skipping trigger setup on node [${node.id}] (SETUP_TRIGGERS_ON_STARTUP is not true).`,
+    );
+  }
 }
 
 function filterPayloadColumns(tableName, payload) {
@@ -516,7 +522,6 @@ async function startMultiBranchEngine() {
       logger.info(`Registered sync worker for branch: [${branch.id}]`);
     }
 
-    // Process all existing backlog immediately on restart
     await flushPendingSyncs(workers);
 
     server = app.listen(CONFIG.port, () => {
