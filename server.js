@@ -85,7 +85,15 @@ const HUB_NODE = {
               : false,
         }
       : parseConnectionString(process.env.LOCAL_URL),
-    pool: { min: 0, max: 20, acquireTimeoutMillis: 5000 },
+    // Hub is queried by BOTH directions of every branch's sync worker
+    // (source for hub->branch reads, target for branch->hub writes),
+    // so its pool needs headroom for ~2x the branch count concurrently.
+    pool: {
+      min: 4,
+      max: parseInt(process.env.HUB_POOL_MAX || "50", 10),
+      acquireTimeoutMillis: 5000,
+      idleTimeoutMillis: 30000,
+    },
   }),
 };
 
@@ -122,6 +130,7 @@ const CONFIG = {
   batchSize: parseInt(process.env.BATCH_SIZE || "500", 10),
   encryptionKey: process.env.PAYLOAD_ENCRYPTION_KEY || null,
   setupTriggersOnStartup: process.env.SETUP_TRIGGERS_ON_STARTUP === "true",
+  maxBackoffMs: parseInt(process.env.MAX_BACKOFF_MS || "30000", 10),
 };
 
 class PayloadCipher {
@@ -394,6 +403,79 @@ class SyncWorker {
   }
 }
 
+/**
+ * Runs one branch's hub<->branch sync independently of every other branch.
+ * A slow or offline branch only affects its own cadence (via exponential
+ * backoff on error) instead of stalling the whole fleet's poll tick.
+ */
+class BranchSyncManager {
+  constructor(branchId, hubToBranch, branchToHub, opts = {}) {
+    this.branchId = branchId;
+    this.hubToBranch = hubToBranch;
+    this.branchToHub = branchToHub;
+    this.pollIntervalMs = opts.pollIntervalMs || CONFIG.pollIntervalMs;
+    this.maxBackoffMs = opts.maxBackoffMs || CONFIG.maxBackoffMs;
+    this.running = true;
+    this.consecutiveErrors = 0;
+    this.lastRunAt = null;
+    this.lastError = null;
+  }
+
+  async loop() {
+    while (this.running) {
+      let hadWork = false;
+      let hadError = false;
+
+      try {
+        const [hubMore, branchMore] = await Promise.all([
+          this.hubToBranch.processBatch(),
+          this.branchToHub.processBatch(),
+        ]);
+        hadWork = hubMore || branchMore;
+        this.consecutiveErrors = 0;
+        this.lastError = null;
+      } catch (err) {
+        hadError = true;
+        this.consecutiveErrors++;
+        this.lastError = err.message;
+        logger.error(
+          `[${this.branchId}] sync error (#${this.consecutiveErrors}): ${err.stack || err.message}`,
+        );
+      }
+
+      this.lastRunAt = new Date();
+
+      if (!this.running) break;
+
+      // Backlog still pending and no error: keep draining immediately.
+      if (hadWork && !hadError) continue;
+
+      const delay = hadError
+        ? Math.min(
+            this.pollIntervalMs * 2 ** Math.min(this.consecutiveErrors, 6),
+            this.maxBackoffMs,
+          )
+        : this.pollIntervalMs;
+
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+
+  stop() {
+    this.running = false;
+  }
+
+  status() {
+    return {
+      branchId: this.branchId,
+      running: this.running,
+      consecutiveErrors: this.consecutiveErrors,
+      lastRunAt: this.lastRunAt,
+      lastError: this.lastError,
+    };
+  }
+}
+
 async function flushPendingSyncs(workers) {
   logger.info(
     "[Startup Sync] Checking and draining pending backlog across all nodes...",
@@ -459,25 +541,49 @@ function requireApiKey(req, res, next) {
   next();
 }
 
+let syncManagers = [];
+
 app.get("/health", requireApiKey, async (req, res) => {
+  let hubMaxChangeId = null;
+  try {
+    const row = await HUB_NODE.db("sym_change_log")
+      .max("change_id as m")
+      .first();
+    hubMaxChangeId = row?.m != null ? BigInt(row.m) : 0n;
+  } catch (err) {
+    logger.error(`[Health] Failed to read hub max change_id: ${err.message}`);
+  }
+
   const branchStatus = [];
   for (const branch of branchNodes) {
+    const manager = syncManagers.find((m) => m.branchId === branch.id);
     try {
       const lastCheck = await HUB_NODE.db("sym_checkpoint")
         .where("node_id", branch.id)
         .first();
+
+      const lastProcessed = lastCheck?.last_processed_change_id
+        ? BigInt(lastCheck.last_processed_change_id)
+        : 0n;
+
       branchStatus.push({
         branchId: branch.id,
         status: "CONNECTED",
-        lastProcessedChangeId: lastCheck?.last_processed_change_id
-          ? lastCheck.last_processed_change_id.toString()
-          : "0",
+        lastProcessedChangeId: lastProcessed.toString(),
+        hubToBranchLag:
+          hubMaxChangeId != null
+            ? (hubMaxChangeId - lastProcessed).toString()
+            : null,
+        consecutiveErrors: manager?.consecutiveErrors ?? null,
+        lastError: manager?.lastError ?? null,
+        lastRunAt: manager?.lastRunAt ?? null,
       });
     } catch (err) {
       branchStatus.push({
         branchId: branch.id,
         status: "OFFLINE/UNREACHABLE",
         error: err.message,
+        consecutiveErrors: manager?.consecutiveErrors ?? null,
       });
     }
   }
@@ -489,7 +595,6 @@ app.get("/health", requireApiKey, async (req, res) => {
   });
 });
 
-let running = true;
 let isShuttingDown = false;
 let server;
 
@@ -499,7 +604,7 @@ async function startMultiBranchEngine() {
 
     await provisionNode(HUB_NODE);
 
-    const workers = [];
+    const flushList = [];
 
     for (const branch of branchNodes) {
       try {
@@ -513,53 +618,43 @@ async function startMultiBranchEngine() {
         );
       }
 
-      workers.push({
-        branchId: branch.id,
-        hubToBranch: new SyncWorker(HUB_NODE, branch),
-        branchToHub: new SyncWorker(branch, HUB_NODE),
-      });
+      const hubToBranch = new SyncWorker(HUB_NODE, branch);
+      const branchToHub = new SyncWorker(branch, HUB_NODE);
+
+      flushList.push({ branchId: branch.id, hubToBranch, branchToHub });
+
+      const manager = new BranchSyncManager(
+        branch.id,
+        hubToBranch,
+        branchToHub,
+      );
+      syncManagers.push(manager);
 
       logger.info(`Registered sync worker for branch: [${branch.id}]`);
     }
 
-    await flushPendingSyncs(workers);
+    // Drain any backlog once, synchronously, before opening the HTTP port
+    // and before the independent per-branch loops take over.
+    await flushPendingSyncs(flushList);
 
     server = app.listen(CONFIG.port, () => {
       logger.info(`Hub Monitoring API active on port ${CONFIG.port}`);
     });
 
-    while (running) {
-      const tasks = workers.flatMap((w) => [
-        w.hubToBranch.processBatch().catch((err) => {
-          logger.error(
-            `[Sync Error] ${w.branchId} hub->branch: ${err.stack || err.message}`,
-          );
-          return false;
-        }),
-        w.branchToHub.processBatch().catch((err) => {
-          logger.error(
-            `[Sync Error] ${w.branchId} branch->hub: ${err.stack || err.message}`,
-          );
-          return false;
-        }),
-      ]);
-
-      const results = await Promise.all(tasks);
-      if (!running) break;
-
-      const hasMoreData = results.some((hasMore) => hasMore === true);
-      if (!hasMoreData) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, CONFIG.pollIntervalMs),
+    // Each branch now runs its own loop with its own backoff, independent
+    // of every other branch. Fire-and-forget: startMultiBranchEngine()
+    // returns once loops are launched, shutdown() stops them individually.
+    syncManagers.forEach((m) => {
+      m.loop().catch((err) => {
+        logger.error(
+          `[Fatal Branch Loop Error] ${m.branchId}: ${err.stack || err.message}`,
         );
-      }
-    }
+      });
+    });
 
-    logger.info("Sync loop stopped, closing connections...");
-    await HUB_NODE.db.destroy();
-    await Promise.all(branchNodes.map((b) => b.db.destroy()));
-    logger.info("Shutdown complete.");
-    process.exit(0);
+    logger.info(
+      `All ${syncManagers.length} branch sync loops launched independently.`,
+    );
   } catch (err) {
     logger.error(`[Fatal Hub Engine Error]: ${err.stack}`);
     process.exit(1);
@@ -574,7 +669,8 @@ async function shutdown(signal) {
 
   isShuttingDown = true;
   logger.info(`Received ${signal}, shutting down gracefully...`);
-  running = false;
+
+  syncManagers.forEach((m) => m.stop());
 
   setTimeout(() => {
     logger.error("Forcefully shutting down due to timeout.");
@@ -592,6 +688,7 @@ async function shutdown(signal) {
     logger.error(`Error closing DB connections: ${err.message}`);
   }
 
+  logger.info("Shutdown complete.");
   process.exit(0);
 }
 
