@@ -10,32 +10,51 @@ function parseConnectionString(urlStr) {
     user: parsed.username ? decodeURIComponent(parsed.username) : undefined,
     password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
     database: parsed.pathname.replace("/", ""),
-    multipleStatements: true, // Enabled for multi-line trigger creation
   };
 }
 
-const ALLOWED_TABLES = Array.from(
-  new Set(
-    (process.env.ALLOWED_TABLES || "")
-      .split(",")
-      .map((t) => t.trim())
-      .filter(Boolean),
-  ),
-);
+const EXCLUDED_TABLES = new Set([
+  "cache",
+  "cache_locks",
+  "failed_jobs",
+  "job_batches",
+  "jobs",
+  "migrations",
+  "password_reset_tokens",
+  "personal_access_tokens",
+  "sessions",
+  "sym_change_log",
+  "sym_data",
+]);
 
+const localDbConfig = parseConnectionString(process.env.LOCAL_URL);
 const localDb = knex({
   client: "mysql2",
-  connection: parseConnectionString(process.env.LOCAL_URL),
+  connection: localDbConfig,
 });
 
 const branchConfigs = JSON.parse(process.env.BRANCHES_JSON || "[]");
 const branchDbs = branchConfigs.map((b) => ({
   id: b.id,
+  dbConfig: parseConnectionString(b.url),
   db: knex({
     client: "mysql2",
     connection: parseConnectionString(b.url),
   }),
 }));
+
+async function getTargetTables(db, dbName) {
+  const [rows] = await db.raw(
+    `SELECT TABLE_NAME 
+     FROM INFORMATION_SCHEMA.TABLES 
+     WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'`,
+    [dbName],
+  );
+
+  return rows
+    .map((r) => r.TABLE_NAME)
+    .filter((table) => !EXCLUDED_TABLES.has(table));
+}
 
 async function getPrimaryKeyAndColumns(db, tableName) {
   const columns = await db.raw(`SHOW COLUMNS FROM \`${tableName}\``);
@@ -54,95 +73,86 @@ async function getPrimaryKeyAndColumns(db, tableName) {
   return { pkCol, colNames };
 }
 
-async function attachTriggersForNode(nodeId, db) {
+async function attachTriggersForNode(nodeId, db, dbName) {
   console.log(`\n--- Provisioning Triggers for Node: [${nodeId}] ---`);
 
-  if (ALLOWED_TABLES.length === 0) {
-    console.warn("[Warning] ALLOWED_TABLES is empty in .env!");
-    return;
-  }
+  const tables = await getTargetTables(db, dbName);
 
-  for (const table of ALLOWED_TABLES) {
-    try {
-      const hasTable = await db.schema.hasTable(table);
-      if (!hasTable) {
-        console.warn(`[Skip] Table '${table}' does not exist on ${nodeId}`);
-        continue;
+  // Process tables concurrently
+  await Promise.all(
+    tables.map(async (table) => {
+      try {
+        const { pkCol, colNames } = await getPrimaryKeyAndColumns(db, table);
+
+        const jsonNewPairList = colNames
+          .map((col) => `'${col}', NEW.\`${col}\``)
+          .join(", ");
+
+        const jsonOldPairList = colNames
+          .map((col) => `'${col}', OLD.\`${col}\``)
+          .join(", ");
+
+        const insertTriggerSql = `
+          CREATE TRIGGER IF NOT EXISTS \`trg_${table}_ai\`
+          AFTER INSERT ON \`${table}\`
+          FOR EACH ROW
+          BEGIN
+            IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
+              INSERT INTO \`sym_change_log\` (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
+              VALUES ('${table}', 'INSERT', CAST(NEW.\`${pkCol}\` AS CHAR), JSON_OBJECT(${jsonNewPairList}), '${nodeId}', NOW());
+            END IF;
+          END;
+        `;
+
+        const updateTriggerSql = `
+          CREATE TRIGGER IF NOT EXISTS \`trg_${table}_au\`
+          AFTER UPDATE ON \`${table}\`
+          FOR EACH ROW
+          BEGIN
+            IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
+              INSERT INTO \`sym_change_log\` (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
+              VALUES ('${table}', 'UPDATE', CAST(NEW.\`${pkCol}\` AS CHAR), JSON_OBJECT(${jsonNewPairList}), '${nodeId}', NOW());
+            END IF;
+          END;
+        `;
+
+        const deleteTriggerSql = `
+          CREATE TRIGGER IF NOT EXISTS \`trg_${table}_ad\`
+          AFTER DELETE ON \`${table}\`
+          FOR EACH ROW
+          BEGIN
+            IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
+              INSERT INTO \`sym_change_log\` (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
+              VALUES ('${table}', 'DELETE', CAST(OLD.\`${pkCol}\` AS CHAR), JSON_OBJECT(${jsonOldPairList}), '${nodeId}', NOW());
+            END IF;
+          END;
+        `;
+
+        await db.raw(`DROP TRIGGER IF EXISTS \`trg_${table}_ai\``);
+        await db.raw(`DROP TRIGGER IF EXISTS \`trg_${table}_au\``);
+        await db.raw(`DROP TRIGGER IF EXISTS \`trg_${table}_ad\``);
+
+        await db.raw(insertTriggerSql);
+        await db.raw(updateTriggerSql);
+        await db.raw(deleteTriggerSql);
+
+        console.log(`[Success] Triggers attached to table: '${table}'`);
+      } catch (err) {
+        console.error(
+          `[Error] Failed to create triggers for table '${table}' on ${nodeId}:`,
+          err.message,
+        );
       }
-
-      const { pkCol, colNames } = await getPrimaryKeyAndColumns(db, table);
-
-      // Construct JSON payload string for MySQL JSON_OBJECT(col1, NEW.col1, ...)
-      const jsonNewPairList = colNames
-        .map((col) => `'${col}', NEW.\`${col}\``)
-        .join(", ");
-
-      const jsonOldPairList = colNames
-        .map((col) => `'${col}', OLD.\`${col}\``)
-        .join(", ");
-
-      const insertTriggerSql = `
-        CREATE TRIGGER \`trg_${table}_ai\`
-        AFTER INSERT ON \`${table}\`
-        FOR EACH ROW
-        BEGIN
-          IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
-            INSERT INTO \`sym_change_log\` (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
-            VALUES ('${table}', 'INSERT', CAST(NEW.\`${pkCol}\` AS CHAR), JSON_OBJECT(${jsonNewPairList}), '${nodeId}', NOW());
-          END IF;
-        END;
-      `;
-
-      const updateTriggerSql = `
-        CREATE TRIGGER \`trg_${table}_au\`
-        AFTER UPDATE ON \`${table}\`
-        FOR EACH ROW
-        BEGIN
-          IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
-            INSERT INTO \`sym_change_log\` (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
-            VALUES ('${table}', 'UPDATE', CAST(NEW.\`${pkCol}\` AS CHAR), JSON_OBJECT(${jsonNewPairList}), '${nodeId}', NOW());
-          END IF;
-        END;
-      `;
-
-      const deleteTriggerSql = `
-        CREATE TRIGGER \`trg_${table}_ad\`
-        AFTER DELETE ON \`${table}\`
-        FOR EACH ROW
-        BEGIN
-          IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
-            INSERT INTO \`sym_change_log\` (table_name, operation, primary_key_val, row_data, node_source_id, created_at)
-            VALUES ('${table}', 'DELETE', CAST(OLD.\`${pkCol}\` AS CHAR), JSON_OBJECT(${jsonOldPairList}), '${nodeId}', NOW());
-          END IF;
-        END;
-      `;
-
-      // 1. Drop existing triggers
-      await db.raw(`DROP TRIGGER IF EXISTS \`trg_${table}_ai\``);
-      await db.raw(`DROP TRIGGER IF EXISTS \`trg_${table}_au\``);
-      await db.raw(`DROP TRIGGER IF EXISTS \`trg_${table}_ad\``);
-
-      // 2. Create new triggers without IF NOT EXISTS
-      await db.raw(insertTriggerSql);
-      await db.raw(updateTriggerSql);
-      await db.raw(deleteTriggerSql);
-
-      console.log(`[Success] Triggers attached to table: '${table}'`);
-    } catch (err) {
-      console.error(
-        `[Error] Failed to create triggers for table '${table}' on ${nodeId}:`,
-        err.message,
-      );
-    }
-  }
+    }),
+  );
 }
 
 async function main() {
   const hubId = process.env.LOCAL_ID || "NODE_MAIN_HUB";
-  await attachTriggersForNode(hubId, localDb);
+  await attachTriggersForNode(hubId, localDb, localDbConfig.database);
 
   for (const branch of branchDbs) {
-    await attachTriggersForNode(branch.id, branch.db);
+    await attachTriggersForNode(branch.id, branch.db, branch.dbConfig.database);
   }
 
   await localDb.destroy();
