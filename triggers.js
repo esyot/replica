@@ -1,7 +1,6 @@
 require("dotenv").config();
 const knex = require("knex");
 
-// Parse ALLOWED_TABLES dynamically from environment variable
 const rawAllowedTables = process.env.ALLOWED_TABLES || "";
 const ALLOWED_TABLES = new Set(
   rawAllowedTables
@@ -10,7 +9,6 @@ const ALLOWED_TABLES = new Set(
     .filter(Boolean),
 );
 
-// Cache PK queries in memory per table to reduce DB schema lookup overhead
 const pkCache = new Map();
 
 async function getTablePkColumns(node, tableName) {
@@ -47,11 +45,199 @@ async function getTablePkColumns(node, tableName) {
   return pkColumns;
 }
 
+async function getTableColumns(node, tableName) {
+  const db = node.db;
+  const client = node.client;
+
+  if (client === "pg" || client === "postgres") {
+    const res = await db.raw(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = ?;`,
+      [tableName],
+    );
+    return res.rows.map((r) => r.column_name);
+  } else {
+    const res = await db.raw(`SHOW COLUMNS FROM ??`, [tableName]);
+    const rows = res[0] || res;
+    return rows.map((r) => r.Field);
+  }
+}
+
 async function setupNodeTriggers(node) {
+  const db = node.db;
+  const client = node.client;
+  const isPg = client === "pg" || client === "postgres";
+
   console.log(
-    `Setting up triggers on node: ${node.id} for ${ALLOWED_TABLES.size} table(s)`,
+    `[Triggers] Installing triggers on node [${node.id}] (${client}) for ${ALLOWED_TABLES.size} table(s)...`,
   );
-  // Add node database trigger generation/installation logic here if needed
+
+  for (const tableName of ALLOWED_TABLES) {
+    try {
+      const pkColumns = await getTablePkColumns(node, tableName);
+      if (!pkColumns || pkColumns.length === 0) {
+        console.warn(
+          `[Triggers] Skipping '${tableName}' on [${node.id}]: No Primary Key found.`,
+        );
+        continue;
+      }
+
+      const columns = await getTableColumns(node, tableName);
+
+      if (isPg) {
+        await setupPostgresTriggers(db, node.id, tableName, pkColumns, columns);
+      } else {
+        await setupMysqlTriggers(db, node.id, tableName, pkColumns, columns);
+      }
+    } catch (err) {
+      console.error(
+        `[Triggers] Error generating triggers for '${tableName}' on [${node.id}]:`,
+        err.message,
+      );
+    }
+  }
+}
+
+async function setupMysqlTriggers(db, nodeId, tableName, pkColumns, columns) {
+  const buildPkVal = (prefix) => {
+    if (pkColumns.length === 1) {
+      return `CAST(${prefix}.${pkColumns[0]} AS CHAR)`;
+    }
+    return `CONCAT_WS('-', ${pkColumns.map((col) => `CAST(${prefix}.${col} AS CHAR)`).join(", ")})`;
+  };
+
+  const jsonFields = columns
+    .map(
+      (col) =>
+        `'${col}', ${col === "updated_at" || col === "created_at" ? `DATE_FORMAT(NEW.${col}, '%Y-%m-%d %H:%i:%s')` : `NEW.${col}`}`,
+    )
+    .join(", ");
+
+  const jsonFieldsOld = columns
+    .map(
+      (col) =>
+        `'${col}', ${col === "updated_at" || col === "created_at" ? `DATE_FORMAT(OLD.${col}, '%Y-%m-%d %H:%i:%s')` : `OLD.${col}`}`,
+    )
+    .join(", ");
+
+  const triggerInsert = `sym_trig_${tableName}_ins`;
+  const triggerUpdate = `sym_trig_${tableName}_upd`;
+  const triggerDelete = `sym_trig_${tableName}_del`;
+
+  await db.raw(`DROP TRIGGER IF EXISTS ??`, [triggerInsert]);
+  await db.raw(`DROP TRIGGER IF EXISTS ??`, [triggerUpdate]);
+  await db.raw(`DROP TRIGGER IF EXISTS ??`, [triggerDelete]);
+
+  // INSERT TRIGGER
+  await db.raw(
+    `
+    CREATE TRIGGER ?? 
+    AFTER INSERT ON ??
+    FOR EACH ROW
+    BEGIN
+      IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
+        INSERT INTO sym_change_log (table_name, operation, primary_key_val, row_data, node_source_id)
+        VALUES ('${tableName}', 'INSERT', ${buildPkVal("NEW")}, JSON_OBJECT(${jsonFields}), '${nodeId}');
+      END IF;
+    END;
+  `,
+    [triggerInsert, tableName],
+  );
+
+  // UPDATE TRIGGER
+  await db.raw(
+    `
+    CREATE TRIGGER ?? 
+    AFTER UPDATE ON ??
+    FOR EACH ROW
+    BEGIN
+      IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
+        INSERT INTO sym_change_log (table_name, operation, primary_key_val, row_data, node_source_id)
+        VALUES ('${tableName}', 'UPDATE', ${buildPkVal("NEW")}, JSON_OBJECT(${jsonFields}), '${nodeId}');
+      END IF;
+    END;
+  `,
+    [triggerUpdate, tableName],
+  );
+
+  // DELETE TRIGGER
+  await db.raw(
+    `
+    CREATE TRIGGER ?? 
+    AFTER DELETE ON ??
+    FOR EACH ROW
+    BEGIN
+      IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
+        INSERT INTO sym_change_log (table_name, operation, primary_key_val, row_data, node_source_id)
+        VALUES ('${tableName}', 'DELETE', ${buildPkVal("OLD")}, JSON_OBJECT(${jsonFieldsOld}), '${nodeId}');
+      END IF;
+    END;
+  `,
+    [triggerDelete, tableName],
+  );
+}
+
+async function setupPostgresTriggers(
+  db,
+  nodeId,
+  tableName,
+  pkColumns,
+  columns,
+) {
+  const funcName = `sym_fn_${tableName}_change`;
+  const triggerName = `sym_trig_${tableName}`;
+
+  await db.raw(`DROP TRIGGER IF EXISTS ?? ON ??;`, [triggerName, tableName]);
+  await db.raw(`DROP FUNCTION IF EXISTS ??();`, [funcName]);
+
+  const pkBuild =
+    pkColumns.length === 1
+      ? `CAST(target_record.${pkColumns[0]} AS TEXT)`
+      : pkColumns
+          .map((col) => `CAST(target_record.${col} AS TEXT)`)
+          .join(" || '-' || ");
+
+  await db.raw(`
+    CREATE OR REPLACE FUNCTION ${funcName}()
+    RETURNS TRIGGER AS $$
+    DECLARE
+      is_syncing TEXT;
+      target_record RECORD;
+      pk_val TEXT;
+      row_json TEXT;
+    BEGIN
+      BEGIN
+        is_syncing := current_setting('sym.is_syncing', true);
+      EXCEPTION WHEN OTHERS THEN
+        is_syncing := 'false';
+      END;
+
+      IF is_syncing IS NULL OR is_syncing != 'true' THEN
+        IF (TG_OP = 'DELETE') THEN
+          target_record := OLD;
+        ELSE
+          target_record := NEW;
+        END IF;
+
+        pk_val := ${pkBuild};
+        row_json := row_to_json(target_record)::text;
+
+        INSERT INTO sym_change_log (table_name, operation, primary_key_val, row_data, node_source_id)
+        VALUES ('${tableName}', TG_OP, pk_val, row_json, '${nodeId}');
+      END IF;
+
+      RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
+
+  await db.raw(
+    `
+    CREATE TRIGGER ${triggerName}
+    AFTER INSERT OR UPDATE OR DELETE ON ??
+    FOR EACH ROW EXECUTE FUNCTION ${funcName}();
+  `,
+    [tableName],
+  );
 }
 
 module.exports = {
@@ -60,7 +246,6 @@ module.exports = {
   ALLOWED_TABLES,
 };
 
-// ONLY EXECUTE SCRIPT IF RUN DIRECTLY (e.g. `node triggers.js`)
 if (require.main === module) {
   function parseConnectionString(urlStr) {
     if (!urlStr) throw new Error("empty connection string");
@@ -85,7 +270,6 @@ if (require.main === module) {
   async function run() {
     const nodesToSetup = [];
 
-    // Load Main Hub
     if (process.env.LOCAL_URL) {
       const hubClient = normalizeClient(process.env.LOCAL_CLIENT);
       nodesToSetup.push({
@@ -97,7 +281,6 @@ if (require.main === module) {
       });
     }
 
-    // Load Branches
     let branches = [];
     try {
       branches = JSON.parse(process.env.BRANCHES_JSON || "[]");
