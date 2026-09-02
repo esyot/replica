@@ -242,13 +242,7 @@ class SyncWorker {
       return BigInt(record.last_processed_change_id);
     }
 
-    const latestLog = await this.source
-      .db("sym_change_log")
-      .whereNot("node_source_id", this.target.id)
-      .max("change_id as max_id")
-      .first();
-
-    const initialCheckpoint = latestLog?.max_id ? BigInt(latestLog.max_id) : 0n;
+    const initialCheckpoint = 0n;
     await this.setCheckpoint(initialCheckpoint);
 
     logger.info(
@@ -259,21 +253,14 @@ class SyncWorker {
 
   async setCheckpoint(lastChangeId, trx) {
     const db = trx || this.target.db;
-    const exists = await db("sym_checkpoint")
-      .where("node_id", this.source.id)
-      .first();
-    if (exists) {
-      await db("sym_checkpoint").where("node_id", this.source.id).update({
-        last_processed_change_id: lastChangeId.toString(),
-        updated_at: new Date(),
-      });
-    } else {
-      await db("sym_checkpoint").insert({
+    await db("sym_checkpoint")
+      .insert({
         node_id: this.source.id,
         last_processed_change_id: lastChangeId.toString(),
         updated_at: new Date(),
-      });
-    }
+      })
+      .onConflict("node_id")
+      .merge();
   }
 
   async setSessionBypass(trx) {
@@ -311,53 +298,31 @@ class SyncWorker {
   async applyTableChanges(trx, tableName, tableChanges) {
     const pkColumns = await getTablePkColumns(this.target, tableName);
 
+    const deletes = [];
+    const upserts = [];
+
     for (const change of tableChanges) {
-      const payload = this.decodePayload(change);
-
       if (change.operation === "DELETE") {
-        const deleteQuery = trx(tableName);
-        if (pkColumns.length === 1) {
-          deleteQuery.where(pkColumns[0], change.primary_key_val);
-        } else {
-          const pkVals = String(change.primary_key_val).split("-");
-          pkColumns.forEach((col, idx) => deleteQuery.where(col, pkVals[idx]));
-        }
-        await deleteQuery.del();
+        deletes.push(change);
       } else {
-        const matchQuery = trx(tableName);
-        if (pkColumns.length === 1) {
-          const val =
-            payload && payload[pkColumns[0]] !== undefined
-              ? payload[pkColumns[0]]
-              : change.primary_key_val;
-          matchQuery.where(pkColumns[0], val);
-        } else {
-          const pkVals = String(change.primary_key_val).split("-");
-          pkColumns.forEach((col, idx) => {
-            const val =
-              payload && payload[col] !== undefined
-                ? payload[col]
-                : pkVals[idx];
-            matchQuery.where(col, val);
-          });
-        }
-
-        const existingRecord = await matchQuery.first();
-
-        if (!existingRecord) {
-          await trx(tableName).insert(payload);
-        } else {
-          const updateQuery = trx(tableName);
-          if (pkColumns.length === 1) {
-            updateQuery.where(pkColumns[0], existingRecord[pkColumns[0]]);
-          } else {
-            pkColumns.forEach((col) =>
-              updateQuery.where(col, existingRecord[col]),
-            );
-          }
-          await updateQuery.update(payload);
-        }
+        const payload = this.decodePayload(change);
+        upserts.push(payload);
       }
+    }
+
+    for (const change of deletes) {
+      const deleteQuery = trx(tableName);
+      if (pkColumns.length === 1) {
+        deleteQuery.where(pkColumns[0], change.primary_key_val);
+      } else {
+        const pkVals = String(change.primary_key_val).split("-");
+        pkColumns.forEach((col, idx) => deleteQuery.where(col, pkVals[idx]));
+      }
+      await deleteQuery.del();
+    }
+
+    if (upserts.length > 0) {
+      await trx(tableName).insert(upserts).onConflict(pkColumns).merge();
     }
   }
 
@@ -409,7 +374,7 @@ class SyncWorker {
         await this.setCheckpoint(lastBatchId, trx);
       });
 
-      return true;
+      return changes.length === CONFIG.batchSize;
     } finally {
       this.isProcessing = false;
     }
@@ -528,11 +493,15 @@ async function startMultiBranchEngine() {
         }),
       ]);
 
-      await Promise.all(tasks);
+      const results = await Promise.all(tasks);
       if (!running) break;
-      await new Promise((resolve) =>
-        setTimeout(resolve, CONFIG.pollIntervalMs),
-      );
+
+      const hasMoreData = results.some((hasMore) => hasMore === true);
+      if (!hasMoreData) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, CONFIG.pollIntervalMs),
+        );
+      }
     }
 
     logger.info("Sync loop stopped, closing connections...");
