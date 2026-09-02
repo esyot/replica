@@ -158,7 +158,6 @@ class PayloadCipher {
   }
 }
 
-// Global cache for PK metadata to prevent repeated schema queries during batch execution
 const tablePkCache = new Map();
 
 async function getTablePkColumns(node, tableName) {
@@ -204,7 +203,6 @@ async function getTablePkColumns(node, tableName) {
   return pkColumns;
 }
 
-// Complete Trigger Generator for INSERT, UPDATE, and DELETE operations
 async function setupNodeTriggers(node) {
   const db = node.db;
   const client = node.client;
@@ -231,11 +229,11 @@ async function setupNodeTriggers(node) {
           .map((col) => `'${col}', OLD.\`${col}\``)
           .join(", ");
 
-        const triggerSql = `
-          DROP TRIGGER IF EXISTS \`trg_${tableName}_ai\`;
-          DROP TRIGGER IF EXISTS \`trg_${tableName}_au\`;
-          DROP TRIGGER IF EXISTS \`trg_${tableName}_ad\`;
+        await db.raw(`DROP TRIGGER IF EXISTS \`trg_${tableName}_ai\`;`);
+        await db.raw(`DROP TRIGGER IF EXISTS \`trg_${tableName}_au\`;`);
+        await db.raw(`DROP TRIGGER IF EXISTS \`trg_${tableName}_ad\`;`);
 
+        await db.raw(`
           CREATE TRIGGER \`trg_${tableName}_ai\` AFTER INSERT ON \`${tableName}\` FOR EACH ROW
           BEGIN
             IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
@@ -243,7 +241,9 @@ async function setupNodeTriggers(node) {
               VALUES ('${tableName}', 'INSERT', ${pkNewSql}, JSON_OBJECT(${jsonFieldsNew}), '${node.id}', NOW());
             END IF;
           END;
+        `);
 
+        await db.raw(`
           CREATE TRIGGER \`trg_${tableName}_au\` AFTER UPDATE ON \`${tableName}\` FOR EACH ROW
           BEGIN
             IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
@@ -251,7 +251,9 @@ async function setupNodeTriggers(node) {
               VALUES ('${tableName}', 'UPDATE', ${pkNewSql}, JSON_OBJECT(${jsonFieldsNew}), '${node.id}', NOW());
             END IF;
           END;
+        `);
 
+        await db.raw(`
           CREATE TRIGGER \`trg_${tableName}_ad\` AFTER DELETE ON \`${tableName}\` FOR EACH ROW
           BEGIN
             IF @sym_is_syncing IS NULL OR @sym_is_syncing = FALSE THEN
@@ -259,9 +261,7 @@ async function setupNodeTriggers(node) {
               VALUES ('${tableName}', 'DELETE', ${pkOldSql}, JSON_OBJECT(${jsonFieldsOld}), '${node.id}', NOW());
             END IF;
           END;
-        `;
-
-        await db.raw(triggerSql);
+        `);
       } else if (client === "pg" || client === "postgres") {
         const pgPkNewSql = pkColumns.map((c) => `NEW.${c}`).join(" || '-' || ");
         const pgPkOldSql = pkColumns.map((c) => `OLD.${c}`).join(" || '-' || ");
@@ -466,7 +466,6 @@ class SyncWorker {
         }
         await deleteQuery.del();
       } else {
-        // Handle INSERT / UPDATE with Upsert logic (insert or update on duplicate key)
         const matchQuery = trx(tableName);
         if (pkColumns.length === 1) {
           const val =
@@ -534,7 +533,6 @@ class SyncWorker {
         `[Sync Engine] ${this.source.id} -> ${this.target.id} | Processing ${changes.length} events...`,
       );
 
-      // Group into strict sequential per-table execution order
       const byTable = new Map();
       for (const change of changes) {
         if (!ALLOWED_TABLES.has(change.table_name)) continue;
