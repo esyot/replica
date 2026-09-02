@@ -10,6 +10,7 @@ function parseConnectionString(urlStr) {
     user: parsed.username ? decodeURIComponent(parsed.username) : undefined,
     password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
     database: parsed.pathname.replace("/", ""),
+    multipleStatements: true, // Enabled for multi-line trigger creation
   };
 }
 
@@ -56,6 +57,11 @@ async function getPrimaryKeyAndColumns(db, tableName) {
 async function attachTriggersForNode(nodeId, db) {
   console.log(`\n--- Provisioning Triggers for Node: [${nodeId}] ---`);
 
+  if (ALLOWED_TABLES.length === 0) {
+    console.warn("[Warning] ALLOWED_TABLES is empty in .env!");
+    return;
+  }
+
   for (const table of ALLOWED_TABLES) {
     try {
       const hasTable = await db.schema.hasTable(table);
@@ -76,7 +82,7 @@ async function attachTriggersForNode(nodeId, db) {
         .join(", ");
 
       const insertTriggerSql = `
-        CREATE TRIGGER IF NOT EXISTS \`trg_${table}_ai\`
+        CREATE TRIGGER \`trg_${table}_ai\`
         AFTER INSERT ON \`${table}\`
         FOR EACH ROW
         BEGIN
@@ -88,7 +94,7 @@ async function attachTriggersForNode(nodeId, db) {
       `;
 
       const updateTriggerSql = `
-        CREATE TRIGGER IF NOT EXISTS \`trg_${table}_au\`
+        CREATE TRIGGER \`trg_${table}_au\`
         AFTER UPDATE ON \`${table}\`
         FOR EACH ROW
         BEGIN
@@ -100,7 +106,7 @@ async function attachTriggersForNode(nodeId, db) {
       `;
 
       const deleteTriggerSql = `
-        CREATE TRIGGER IF NOT EXISTS \`trg_${table}_ad\`
+        CREATE TRIGGER \`trg_${table}_ad\`
         AFTER DELETE ON \`${table}\`
         FOR EACH ROW
         BEGIN
@@ -111,12 +117,12 @@ async function attachTriggersForNode(nodeId, db) {
         END;
       `;
 
-      // Drop old triggers if exist to ensure updated definitions
+      // 1. Drop existing triggers
       await db.raw(`DROP TRIGGER IF EXISTS \`trg_${table}_ai\``);
       await db.raw(`DROP TRIGGER IF EXISTS \`trg_${table}_au\``);
       await db.raw(`DROP TRIGGER IF EXISTS \`trg_${table}_ad\``);
 
-      // Create new triggers
+      // 2. Create new triggers without IF NOT EXISTS
       await db.raw(insertTriggerSql);
       await db.raw(updateTriggerSql);
       await db.raw(deleteTriggerSql);
