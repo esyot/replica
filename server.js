@@ -63,14 +63,20 @@ function parseConnectionString(urlStr) {
   };
 }
 
-const isHubPg =
-  process.env.LOCAL_CLIENT === "pg" || process.env.LOCAL_CLIENT === "postgres";
+function normalizeClient(client) {
+  if (!client) return "mysql2";
+  const c = client.toLowerCase().trim();
+  return c === "mysql" ? "mysql2" : c;
+}
+
+const hubClient = normalizeClient(process.env.LOCAL_CLIENT);
+const isHubPg = hubClient === "pg" || hubClient === "postgres";
 
 const HUB_NODE = {
   id: process.env.LOCAL_ID || "NODE_MAIN_HUB",
-  client: process.env.LOCAL_CLIENT || "mysql2",
+  client: hubClient,
   db: knex({
-    client: process.env.LOCAL_CLIENT || "mysql2",
+    client: hubClient,
     connection: isHubPg
       ? {
           connectionString: process.env.LOCAL_URL,
@@ -87,8 +93,8 @@ const HUB_NODE = {
 const BRANCHES_CONFIG = JSON.parse(process.env.BRANCHES_JSON || "[]");
 
 const branchNodes = BRANCHES_CONFIG.map((b) => {
-  const isPg = b.client === "pg" || b.client === "postgres";
-  const clientName = b.client || "pg";
+  const clientName = normalizeClient(b.client);
+  const isPg = clientName === "pg" || clientName === "postgres";
 
   return {
     id: b.id,
@@ -98,7 +104,6 @@ const branchNodes = BRANCHES_CONFIG.map((b) => {
       connection: isPg
         ? {
             connectionString: b.url,
-
             ssl: { rejectUnauthorized: b.sslInsecure !== true },
           }
         : parseConnectionString(b.url),
