@@ -122,16 +122,37 @@ const CONFIG = {
 class PayloadCipher {
   static decrypt(cipherText, keyHex) {
     if (!keyHex) return cipherText;
+    if (!cipherText) return null;
+
+    let parsed;
     try {
-      const { iv, encrypted, authTag } = JSON.parse(cipherText);
+      parsed =
+        typeof cipherText === "string" ? JSON.parse(cipherText) : cipherText;
+    } catch (err) {
+      // If it's raw non-JSON text, return as-is
+      return cipherText;
+    }
+
+    // Check if the payload is unencrypted raw database row data (lacks AES-GCM properties)
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      !parsed.iv ||
+      !parsed.encrypted ||
+      !parsed.authTag
+    ) {
+      return parsed;
+    }
+
+    try {
       const key = Buffer.from(keyHex, "hex");
       const decipher = crypto.createDecipheriv(
         "aes-256-gcm",
         key,
-        Buffer.from(iv, "hex"),
+        Buffer.from(parsed.iv, "hex"),
       );
-      decipher.setAuthTag(Buffer.from(authTag, "hex"));
-      let decrypted = decipher.update(encrypted, "hex", "utf8");
+      decipher.setAuthTag(Buffer.from(parsed.authTag, "hex"));
+      let decrypted = decipher.update(parsed.encrypted, "hex", "utf8");
       decrypted += decipher.final("utf8");
       return decrypted;
     } catch (err) {
@@ -188,7 +209,7 @@ async function provisionNode(node) {
 
 function filterPayloadColumns(tableName, payload) {
   const allowed = ALLOWED_COLUMNS[tableName];
-  if (!allowed) return payload;
+  if (!allowed || !payload || typeof payload !== "object") return payload;
   const filtered = {};
   for (const key of allowed) {
     if (Object.prototype.hasOwnProperty.call(payload, key)) {
@@ -278,10 +299,18 @@ class SyncWorker {
         CONFIG.encryptionKey,
       );
     }
-    const payload =
-      typeof rawPayloadJson === "string"
-        ? JSON.parse(rawPayloadJson)
-        : rawPayloadJson;
+
+    let payload;
+    if (typeof rawPayloadJson === "string") {
+      try {
+        payload = JSON.parse(rawPayloadJson);
+      } catch (err) {
+        payload = rawPayloadJson;
+      }
+    } else {
+      payload = rawPayloadJson;
+    }
+
     return filterPayloadColumns(change.table_name, payload);
   }
 
@@ -320,9 +349,10 @@ class SyncWorker {
         toInsert.push(payload);
         continue;
       }
-      const incomingTs = payload.updated_at
-        ? new Date(payload.updated_at).getTime()
-        : Date.now();
+      const incomingTs =
+        payload && payload.updated_at
+          ? new Date(payload.updated_at).getTime()
+          : Date.now();
       const existingTs = existing.updated_at
         ? new Date(existing.updated_at).getTime()
         : 0;
