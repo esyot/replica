@@ -12,6 +12,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "ping": "node ping-branches.js"
+    "ping": "node ping-branches.js",
+    "triggers": "node triggers.js"
   }
 }
