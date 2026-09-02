@@ -465,16 +465,24 @@ let server;
 async function startMultiBranchEngine() {
   try {
     logger.info(`Starting Hub-and-Spoke Engine for Hub [${HUB_NODE.id}]...`);
+
+    // 1. Provision Hub schema first
     await provisionNode(HUB_NODE);
 
     const workers = [];
 
+    // 2. Ensure all branch schemas are provisioned BEFORE starting the sync loop
     for (const branch of branchNodes) {
-      provisionNode(branch).catch((err) => {
-        logger.warn(
-          `[Startup] Branch [${branch.id}] schema check deferred: ${err.message}`,
+      try {
+        await provisionNode(branch);
+        logger.info(
+          `[Startup] Provisioned/Verified schema for branch: [${branch.id}]`,
         );
-      });
+      } catch (err) {
+        logger.warn(
+          `[Startup] Branch [${branch.id}] unreachable during startup provisioning: ${err.message}`,
+        );
+      }
 
       workers.push({
         branchId: branch.id,
@@ -489,6 +497,7 @@ async function startMultiBranchEngine() {
       logger.info(`Hub Monitoring API active on port ${CONFIG.port}`);
     });
 
+    // 3. Main Engine Loop: Runs sync tasks for all branches in parallel
     while (running) {
       const tasks = workers.flatMap((w) => [
         w.hubToBranch.processBatch().catch((err) => {
