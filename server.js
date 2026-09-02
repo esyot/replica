@@ -6,11 +6,7 @@ const crypto = require("crypto");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 
-const {
-  getTablePkColumns,
-  setupNodeTriggers,
-  ALLOWED_TABLES,
-} = require("./triggers");
+const { getTablePkColumns, ALLOWED_TABLES } = require("./triggers");
 
 const logger = winston.createLogger({
   level: process.env.NODE_ENV === "production" ? "info" : "debug",
@@ -215,8 +211,6 @@ async function provisionNode(node) {
       if (!err.message.includes("Duplicate key name")) throw err;
     }
   }
-
-  await setupNodeTriggers(node);
 }
 
 function filterPayloadColumns(tableName, payload) {
@@ -496,7 +490,7 @@ async function startMultiBranchEngine() {
       try {
         await provisionNode(branch);
         logger.info(
-          `[Startup] Provisioned schema, settings, and triggers for branch: [${branch.id}]`,
+          `[Startup] Provisioned schema and settings for branch: [${branch.id}]`,
         );
       } catch (err) {
         logger.warn(
@@ -544,18 +538,33 @@ async function startMultiBranchEngine() {
     await HUB_NODE.db.destroy();
     await Promise.all(branchNodes.map((b) => b.db.destroy()));
     logger.info("Shutdown complete.");
+    process.exit(0);
   } catch (err) {
     logger.error(`[Fatal Hub Engine Error]: ${err.stack}`);
     process.exit(1);
   }
 }
 
+let isShuttingDown = false;
+
 function shutdown(signal) {
+  if (isShuttingDown) {
+    logger.info("Forced exit requested.");
+    process.exit(1);
+  }
+
+  isShuttingDown = true;
   logger.info(`Received ${signal}, shutting down gracefully...`);
   running = false;
+
   if (server) {
     server.close();
   }
+
+  setTimeout(() => {
+    logger.error("Timed out waiting for tasks, exiting now.");
+    process.exit(1);
+  }, 2000).unref();
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
