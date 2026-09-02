@@ -291,6 +291,7 @@ class SyncWorker {
       await trx.raw("SET LOCAL sym.is_syncing = 'true'");
     } else if (client === "mysql2" || client === "mysql") {
       await trx.raw("SET @sym_is_syncing = TRUE");
+      await trx.raw("SET FOREIGN_KEY_CHECKS = 0;");
     }
   }
 
@@ -394,6 +395,10 @@ class SyncWorker {
 
         const lastBatchId = changes[changes.length - 1].change_id;
         await this.setCheckpoint(lastBatchId, trx);
+
+        if (this.target.client === "mysql2" || this.target.client === "mysql") {
+          await trx.raw("SET FOREIGN_KEY_CHECKS = 1;");
+        }
       });
 
       return changes.length === CONFIG.batchSize;
