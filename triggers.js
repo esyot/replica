@@ -1,47 +1,137 @@
 require("dotenv").config();
-const { setupNodeTriggers } = require("./triggers");
 const knex = require("knex");
 
-function parseConnectionString(urlStr) {
-  if (!urlStr) throw new Error("empty connection string");
-  const parsed = new URL(urlStr);
-  return {
-    host: parsed.hostname || "127.0.0.1",
-    port: parsed.port ? parseInt(parsed.port, 10) : 3306,
-    user: parsed.username ? decodeURIComponent(parsed.username) : undefined,
-    password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
-    database: parsed.pathname.replace("/", ""),
-  };
-}
+const ALLOWED_TABLES = new Set([
+  // Add your tables here
+  "card_transaction",
+]);
 
-function normalizeClient(client) {
-  if (!client) return "mysql2";
-  const c = client.toLowerCase().trim();
-  return c === "mysql" ? "mysql2" : c;
-}
+async function getTablePkColumns(node, tableName) {
+  const db = node.db;
+  const client = node.client;
 
-async function run() {
-  const branches = JSON.parse(process.env.BRANCHES_JSON || "[]");
-
-  for (const b of branches) {
-    const clientName = normalizeClient(b.client);
-    const isPg = clientName === "pg" || clientName === "postgres";
-    const db = knex({
-      client: clientName,
-      connection: isPg
-        ? { connectionString: b.url }
-        : parseConnectionString(b.url),
-    });
-
-    const node = { id: b.id, client: clientName, db };
-    console.log(`Setting up triggers for ${node.id}...`);
-    await setupNodeTriggers(node);
-    await db.destroy();
+  if (client === "pg" || client === "postgres") {
+    const res = await db.raw(
+      `SELECT a.attname
+       FROM pg_index i
+       JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+       WHERE i.indrelid = ?::regclass AND i.indisprimary;`,
+      [tableName],
+    );
+    return res.rows.map((r) => r.attname);
+  } else {
+    const res = await db.raw(`SHOW KEYS FROM ?? WHERE Key_name = 'PRIMARY'`, [
+      tableName,
+    ]);
+    const rows = res[0] || res;
+    return rows.map((r) => r.Column_name);
   }
-  console.log("Trigger setup complete.");
 }
 
-run().catch((err) => {
-  console.error("Trigger setup failed:", err);
-  process.exit(1);
-});
+async function setupNodeTriggers(node) {
+  // Your database trigger creation logic here...
+  console.log(`Setting up triggers on node: ${node.id}`);
+}
+
+module.exports = {
+  getTablePkColumns,
+  setupNodeTriggers,
+  ALLOWED_TABLES,
+};
+
+// ONLY EXECUTE SCRIPT IF RUN DIRECTLY (e.g. `node triggers.js`)
+if (require.main === module) {
+  function parseConnectionString(urlStr) {
+    if (!urlStr) throw new Error("empty connection string");
+    const parsed = new URL(urlStr);
+    return {
+      host: parsed.hostname || "127.0.0.1",
+      port: parsed.port ? parseInt(parsed.port, 10) : 3306,
+      user: parsed.username ? decodeURIComponent(parsed.username) : undefined,
+      password: parsed.password
+        ? decodeURIComponent(parsed.password)
+        : undefined,
+      database: parsed.pathname.replace("/", ""),
+    };
+  }
+
+  function normalizeClient(client) {
+    if (!client) return "mysql2";
+    const c = client.toLowerCase().trim();
+    return c === "mysql" ? "mysql2" : c;
+  }
+
+  async function run() {
+    const nodesToSetup = [];
+
+    // Load Main Hub
+    if (process.env.LOCAL_URL) {
+      const hubClient = normalizeClient(process.env.LOCAL_CLIENT);
+      nodesToSetup.push({
+        id: process.env.LOCAL_ID || "NODE_MAIN_HUB",
+        client: hubClient,
+        url: process.env.LOCAL_URL,
+        ssl: process.env.LOCAL_SSL === "true",
+        sslStrict: process.env.LOCAL_SSL_STRICT !== "false",
+      });
+    }
+
+    // Load Branches
+    let branches = [];
+    try {
+      branches = JSON.parse(process.env.BRANCHES_JSON || "[]");
+    } catch (err) {
+      console.error("Failed to parse BRANCHES_JSON:", err.message);
+    }
+
+    for (const b of branches) {
+      const branchClient = normalizeClient(b.client);
+      nodesToSetup.push({
+        id: b.id,
+        client: branchClient,
+        url: b.url,
+        ssl: b.sslInsecure !== true,
+        sslStrict: true,
+      });
+    }
+
+    if (nodesToSetup.length === 0) {
+      console.warn("No database connection strings found in .env.");
+      return;
+    }
+
+    for (const n of nodesToSetup) {
+      const isPg = n.client === "pg" || n.client === "postgres";
+      const db = knex({
+        client: n.client,
+        connection: isPg
+          ? {
+              connectionString: n.url,
+              ssl: n.ssl ? { rejectUnauthorized: n.sslStrict } : false,
+            }
+          : parseConnectionString(n.url),
+      });
+
+      const node = { id: n.id, client: n.client, db };
+      console.log(`Setting up triggers for node [${node.id}]...`);
+      try {
+        await setupNodeTriggers(node);
+        console.log(`Successfully configured triggers for [${node.id}]`);
+      } catch (err) {
+        console.error(
+          `Failed to set up triggers for [${node.id}]:`,
+          err.message,
+        );
+      } finally {
+        await db.destroy();
+      }
+    }
+
+    console.log("\nAll trigger setups completed.");
+  }
+
+  run().catch((err) => {
+    console.error("Fatal error during trigger setup:", err);
+    process.exit(1);
+  });
+}

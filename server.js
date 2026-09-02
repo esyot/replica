@@ -211,8 +211,6 @@ async function provisionNode(node) {
       if (!err.message.includes("Duplicate key name")) throw err;
     }
   }
-
-  // NOTE: setupNodeTriggers removed intentionally.
 }
 
 function filterPayloadColumns(tableName, payload) {
