@@ -85,9 +85,6 @@ const HUB_NODE = {
               : false,
         }
       : parseConnectionString(process.env.LOCAL_URL),
-    // Hub is queried by BOTH directions of every branch's sync worker
-    // (source for hub->branch reads, target for branch->hub writes),
-    // so its pool needs headroom for ~2x the branch count concurrently.
     pool: {
       min: 4,
       max: parseInt(process.env.HUB_POOL_MAX || "50", 10),
@@ -247,6 +244,24 @@ function filterPayloadColumns(tableName, payload) {
   return filtered;
 }
 
+// Helper function to recursively scrub zero-dates from payload objects
+function sanitizeZeroDates(obj) {
+  if (!obj || typeof obj !== "object") return obj;
+
+  for (const key of Object.keys(obj)) {
+    const val = obj[key];
+    if (typeof val === "string") {
+      // Matches '0000-00-00', '0000-00-00 00:00:00', '0000-00-00T00:00:00', or any value starting with zero-date
+      if (val.startsWith("0000-00-00") || val.includes("0000-00-00")) {
+        obj[key] = null;
+      }
+    } else if (typeof val === "object" && val !== null) {
+      sanitizeZeroDates(val);
+    }
+  }
+  return obj;
+}
+
 class SyncWorker {
   constructor(source, target) {
     this.source = source;
@@ -292,6 +307,9 @@ class SyncWorker {
     } else if (client === "mysql2" || client === "mysql") {
       await trx.raw("SET @sym_is_syncing = TRUE;");
       await trx.raw("SET FOREIGN_KEY_CHECKS = 0;");
+      await trx.raw(
+        "SET SESSION sql_mode = REPLACE(REPLACE(@@sql_mode, 'NO_ZERO_DATE', ''), 'NO_ZERO_IN_DATE', '');",
+      );
     }
   }
 
@@ -317,18 +335,8 @@ class SyncWorker {
 
     const filtered = filterPayloadColumns(change.table_name, payload);
 
-    if (filtered && typeof filtered === "object") {
-      for (const key of Object.keys(filtered)) {
-        if (
-          filtered[key] === "0000-00-00 00:00:00" ||
-          filtered[key] === "0000-00-00"
-        ) {
-          filtered[key] = null;
-        }
-      }
-    }
-
-    return filtered;
+    // Scrub zero-dates completely
+    return sanitizeZeroDates(filtered);
   }
 
   async applyTableChanges(trx, tableName, tableChanges) {
@@ -428,11 +436,6 @@ class SyncWorker {
   }
 }
 
-/**
- * Runs one branch's hub<->branch sync independently of every other branch.
- * A slow or offline branch only affects its own cadence (via exponential
- * backoff on error) instead of stalling the whole fleet's poll tick.
- */
 class BranchSyncManager {
   constructor(branchId, hubToBranch, branchToHub, opts = {}) {
     this.branchId = branchId;
@@ -472,7 +475,6 @@ class BranchSyncManager {
 
       if (!this.running) break;
 
-      // Backlog still pending and no error: keep draining immediately.
       if (hadWork && !hadError) continue;
 
       const delay = hadError
@@ -658,17 +660,12 @@ async function startMultiBranchEngine() {
       logger.info(`Registered sync worker for branch: [${branch.id}]`);
     }
 
-    // Drain any backlog once, synchronously, before opening the HTTP port
-    // and before the independent per-branch loops take over.
     await flushPendingSyncs(flushList);
 
     server = app.listen(CONFIG.port, () => {
       logger.info(`Hub Monitoring API active on port ${CONFIG.port}`);
     });
 
-    // Each branch now runs its own loop with its own backoff, independent
-    // of every other branch. Fire-and-forget: startMultiBranchEngine()
-    // returns once loops are launched, shutdown() stops them individually.
     syncManagers.forEach((m) => {
       m.loop().catch((err) => {
         logger.error(
