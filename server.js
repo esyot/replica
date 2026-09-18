@@ -232,32 +232,15 @@ async function provisionNode(node) {
   }
 }
 
-function filterPayloadColumns(tableName, payload) {
-  const allowed = ALLOWED_COLUMNS[tableName];
-  if (!allowed || !payload || typeof payload !== "object") return payload;
-  const filtered = {};
-  for (const key of allowed) {
-    if (Object.prototype.hasOwnProperty.call(payload, key)) {
-      filtered[key] = payload[key];
-    }
-  }
-  return filtered;
-}
+const PK_CACHE = new Map();
 
-function sanitizeZeroDates(obj) {
-  if (!obj || typeof obj !== "object") return obj;
-
-  for (const key of Object.keys(obj)) {
-    const val = obj[key];
-    if (typeof val === "string") {
-      if (val.startsWith("0000-00-00") || val.includes("0000-00-00")) {
-        obj[key] = null;
-      }
-    } else if (typeof val === "object" && val !== null) {
-      sanitizeZeroDates(val);
-    }
+async function getCachedPkColumns(node, tableName) {
+  const cacheKey = `${node.id}:${tableName}`;
+  if (!PK_CACHE.has(cacheKey)) {
+    const cols = await getTablePkColumns(node, tableName);
+    PK_CACHE.set(cacheKey, cols);
   }
-  return obj;
+  return PK_CACHE.get(cacheKey);
 }
 
 class SyncWorker {
@@ -273,17 +256,27 @@ class SyncWorker {
       .where("node_id", this.source.id)
       .first();
 
-    if (record) {
-      return BigInt(record.last_processed_change_id);
+    let currentCheckpoint = record
+      ? BigInt(record.last_processed_change_id)
+      : 0n;
+
+    const maxRow = await this.source
+      .db("sym_change_log")
+      .max("change_id as max_id")
+      .first();
+
+    const maxSourceId = maxRow?.max_id != null ? BigInt(maxRow.max_id) : 0n;
+
+    if (currentCheckpoint > maxSourceId) {
+      logger.warn(
+        `[Checkpoint Resync] ${this.source.id} -> ${this.target.id}: ` +
+          `Checkpoint (${currentCheckpoint}) is ahead of source max ID (${maxSourceId}). Resetting...`,
+      );
+      currentCheckpoint = maxSourceId;
+      await this.setCheckpoint(currentCheckpoint);
     }
 
-    const initialCheckpoint = 0n;
-    await this.setCheckpoint(initialCheckpoint);
-
-    logger.info(
-      `[Checkpoint] Initialized ${this.source.id} -> ${this.target.id} at change_id: ${initialCheckpoint}`,
-    );
-    return initialCheckpoint;
+    return currentCheckpoint;
   }
 
   async setCheckpoint(lastChangeId, trx) {
@@ -331,12 +324,30 @@ class SyncWorker {
       payload = rawPayloadJson;
     }
 
-    const filtered = filterPayloadColumns(change.table_name, payload);
-    return sanitizeZeroDates(filtered);
+    if (!payload || typeof payload !== "object") return payload;
+
+    const allowed = ALLOWED_COLUMNS[change.table_name];
+    const targetKeys = allowed || Object.keys(payload);
+    const result = {};
+
+    for (const key of targetKeys) {
+      if (Object.prototype.hasOwnProperty.call(payload, key)) {
+        let val = payload[key];
+        if (
+          typeof val === "string" &&
+          (val.startsWith("0000-00-00") || val.includes("0000-00-00"))
+        ) {
+          val = null;
+        }
+        result[key] = val;
+      }
+    }
+
+    return result;
   }
 
   async applyTableChanges(trx, tableName, tableChanges) {
-    const pkColumns = await getTablePkColumns(this.target, tableName);
+    const pkColumns = await getCachedPkColumns(this.target, tableName);
 
     const deletes = [];
     const upserts = [];
@@ -351,15 +362,23 @@ class SyncWorker {
     }
 
     try {
-      for (const change of deletes) {
-        const deleteQuery = trx(tableName);
+      if (deletes.length > 0) {
         if (pkColumns.length === 1) {
-          deleteQuery.where(pkColumns[0], change.primary_key_val);
+          const pkCol = pkColumns[0];
+          const idsToDelete = deletes.map((d) => d.primary_key_val);
+          await trx(tableName).whereIn(pkCol, idsToDelete).del();
         } else {
-          const pkVals = String(change.primary_key_val).split("-");
-          pkColumns.forEach((col, idx) => deleteQuery.where(col, pkVals[idx]));
+          await Promise.all(
+            deletes.map((change) => {
+              const deleteQuery = trx(tableName);
+              const pkVals = String(change.primary_key_val).split("-");
+              pkColumns.forEach((col, idx) =>
+                deleteQuery.where(col, pkVals[idx]),
+              );
+              return deleteQuery.del();
+            }),
+          );
         }
-        await deleteQuery.del();
       }
 
       if (upserts.length > 0) {
@@ -411,7 +430,6 @@ class SyncWorker {
 
       const lastBatchId = changes[changes.length - 1].change_id;
 
-      // If no valid events were matched for allowed tables, advance checkpoint and exit loop
       if (validEventCount === 0) {
         await this.setCheckpoint(lastBatchId);
         return changes.length === CONFIG.batchSize;
@@ -587,39 +605,40 @@ app.get("/health", requireApiKey, async (req, res) => {
     logger.error(`[Health] Failed to read hub max change_id: ${err.message}`);
   }
 
-  const branchStatus = [];
-  for (const branch of branchNodes) {
-    const manager = syncManagers.find((m) => m.branchId === branch.id);
-    try {
-      const lastCheck = await HUB_NODE.db("sym_checkpoint")
-        .where("node_id", branch.id)
-        .first();
+  const branchStatus = await Promise.all(
+    branchNodes.map(async (branch) => {
+      const manager = syncManagers.find((m) => m.branchId === branch.id);
+      try {
+        const lastCheck = await HUB_NODE.db("sym_checkpoint")
+          .where("node_id", branch.id)
+          .first();
 
-      const lastProcessed = lastCheck?.last_processed_change_id
-        ? BigInt(lastCheck.last_processed_change_id)
-        : 0n;
+        const lastProcessed = lastCheck?.last_processed_change_id
+          ? BigInt(lastCheck.last_processed_change_id)
+          : 0n;
 
-      branchStatus.push({
-        branchId: branch.id,
-        status: "CONNECTED",
-        lastProcessedChangeId: lastProcessed.toString(),
-        hubToBranchLag:
-          hubMaxChangeId != null
-            ? (hubMaxChangeId - lastProcessed).toString()
-            : null,
-        consecutiveErrors: manager?.consecutiveErrors ?? null,
-        lastError: manager?.lastError ?? null,
-        lastRunAt: manager?.lastRunAt ?? null,
-      });
-    } catch (err) {
-      branchStatus.push({
-        branchId: branch.id,
-        status: "OFFLINE/UNREACHABLE",
-        error: err.message,
-        consecutiveErrors: manager?.consecutiveErrors ?? null,
-      });
-    }
-  }
+        return {
+          branchId: branch.id,
+          status: "CONNECTED",
+          lastProcessedChangeId: lastProcessed.toString(),
+          hubToBranchLag:
+            hubMaxChangeId != null
+              ? (hubMaxChangeId - lastProcessed).toString()
+              : null,
+          consecutiveErrors: manager?.consecutiveErrors ?? null,
+          lastError: manager?.lastError ?? null,
+          lastRunAt: manager?.lastRunAt ?? null,
+        };
+      } catch (err) {
+        return {
+          branchId: branch.id,
+          status: "OFFLINE/UNREACHABLE",
+          error: err.message,
+          consecutiveErrors: manager?.consecutiveErrors ?? null,
+        };
+      }
+    }),
+  );
 
   res.json({
     hub: HUB_NODE.id,
