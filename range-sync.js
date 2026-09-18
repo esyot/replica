@@ -237,34 +237,45 @@ async function applyTableChanges(targetNode, trx, tableName, tableChanges) {
 }
 
 /**
- * Safe, non-destructive normalizer for DB vs JSON comparisons.
+ * Robust value normalizer handling DB/JSON differences safely.
  */
 function normalizeVal(val) {
-  // 1. Handle Null / Undefined / Empty String
   if (val === null || val === undefined || val === "") return "";
 
-  // 2. Handle JS Date Objects (from Knex)
+  // 1. Handle JS Date objects
   if (val instanceof Date) {
-    return val.toISOString().replace(".000", "");
+    return Math.floor(val.getTime() / 1000).toString();
   }
 
-  // 3. Handle Booleans / TinyInt
+  // 2. Handle Booleans / TinyInt
   if (typeof val === "boolean") return val ? "1" : "0";
   if (val === "true" || val === "TRUE") return "1";
   if (val === "false" || val === "FALSE") return "0";
 
-  // 4. Handle Numbers / Decimals / Numeric Strings
-  if (
-    typeof val === "number" ||
-    (typeof val === "string" && !isNaN(val) && val.trim() !== "")
-  ) {
-    const num = Number(val);
-    if (!isNaN(num)) return num.toString();
+  // 3. Handle Strings
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+
+    // Safely match Date Strings (e.g., "2026-09-18 00:00:00" or ISO format)
+    if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) {
+      const parsedTime = Date.parse(trimmed.replace(" ", "T"));
+      if (!isNaN(parsedTime)) {
+        return Math.floor(parsedTime / 1000).toString();
+      }
+    }
+
+    // Safely match Pure Numbers / Decimals (reject date strings and text)
+    if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
+      const num = Number(trimmed);
+      return num.toString();
+    }
+
+    return trimmed;
   }
 
-  // 5. Handle standard strings (trim whitespace, normalize empty spaces)
-  if (typeof val === "string") {
-    return val.trim();
+  // 4. Handle Numbers
+  if (typeof val === "number") {
+    return val.toString();
   }
 
   return String(val);
