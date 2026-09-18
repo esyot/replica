@@ -200,16 +200,19 @@ async function setSessionBypass(targetNode, trx) {
 async function applyTableChanges(targetNode, trx, tableName, tableChanges) {
   const pkColumns = await getCachedPkColumns(targetNode, tableName);
   const deletes = [];
-  const upserts = [];
+  const upsertsMap = new Map();
 
   for (const change of tableChanges) {
     if (change.operation === "DELETE") {
       deletes.push(change);
     } else {
       const payload = decodePayload(change);
-      upserts.push(payload);
+      const pkKey = pkColumns.map((col) => payload[col]).join("-");
+      upsertsMap.set(pkKey, payload); // Deduplicate to keep latest state per batch
     }
   }
+
+  const upserts = Array.from(upsertsMap.values());
 
   if (deletes.length > 0) {
     if (pkColumns.length === 1) {
@@ -233,6 +236,53 @@ async function applyTableChanges(targetNode, trx, tableName, tableChanges) {
   }
 }
 
+async function filterUnsyncedRecords(targetNode, tableName, tableChanges) {
+  const pkColumns = await getCachedPkColumns(targetNode, tableName);
+  if (!pkColumns || pkColumns.length === 0) return tableChanges;
+
+  const unsynced = [];
+
+  for (const change of tableChanges) {
+    if (change.operation === "DELETE") {
+      const pkVals = String(change.primary_key_val).split("-");
+      const query = targetNode.db(tableName);
+      pkColumns.forEach((col, idx) => query.where(col, pkVals[idx]));
+      const rowExists = await query.first();
+      if (rowExists) unsynced.push(change);
+    } else {
+      const payload = decodePayload(change);
+      const query = targetNode.db(tableName);
+      pkColumns.forEach((col) => query.where(col, payload[col]));
+      const targetRow = await query.first();
+
+      if (!targetRow) {
+        unsynced.push(change);
+        continue;
+      }
+
+      let modified = false;
+      for (const [col, val] of Object.entries(payload)) {
+        if (targetRow[col] === undefined) continue;
+
+        const targetVal =
+          targetRow[col] instanceof Date
+            ? targetRow[col].toISOString()
+            : targetRow[col];
+        const sourceVal = val instanceof Date ? val.toISOString() : val;
+
+        if (String(targetVal) !== String(sourceVal)) {
+          modified = true;
+          break;
+        }
+      }
+
+      if (modified) unsynced.push(change);
+    }
+  }
+
+  return unsynced;
+}
+
 async function runRangeSync(
   sourceId,
   targetId,
@@ -245,8 +295,9 @@ async function runRangeSync(
   const targetNode = allNodes.find((n) => n.id === targetId);
 
   if (!sourceNode || !targetNode) {
+    const available = allNodes.map((n) => n.id).join(", ");
     logger.error(
-      `Node mismatch: source (${sourceId}) or target (${targetId}) not found.`,
+      `Node mismatch: source ("${sourceId}") or target ("${targetId}") not found. Available nodes: [ ${available} ]`,
     );
     process.exit(1);
   }
@@ -271,89 +322,108 @@ async function runRangeSync(
   let totalRecordsFound = 0;
   const tableCounts = {};
 
-  while (true) {
-    const changes = await sourceNode
-      .db("sym_change_log")
-      .select(
-        "change_id",
-        "table_name",
-        "operation",
-        "primary_key_val",
-        "row_data",
-        "node_source_id",
-      )
-      .whereBetween("created_at", [fromDate, toDate])
-      .where("change_id", ">", lastProcessedId.toString())
-      .whereNot("node_source_id", targetNode.id)
-      .orderBy("change_id", "asc")
-      .limit(batchSize);
+  try {
+    while (true) {
+      const changes = await sourceNode
+        .db("sym_change_log")
+        .select(
+          "change_id",
+          "table_name",
+          "operation",
+          "primary_key_val",
+          "row_data",
+          "node_source_id",
+        )
+        .whereBetween("created_at", [fromDate, toDate])
+        .where("change_id", ">", lastProcessedId.toString())
+        .whereNot("node_source_id", targetNode.id)
+        .orderBy("change_id", "asc")
+        .limit(batchSize);
 
-    if (changes.length === 0) break;
+      if (changes.length === 0) break;
 
-    const byTable = new Map();
-    let validEvents = 0;
+      const byTable = new Map();
+      let validEvents = 0;
 
-    for (const change of changes) {
-      if (!ALLOWED_TABLES.has(change.table_name)) continue;
-      if (!byTable.has(change.table_name)) byTable.set(change.table_name, []);
-      byTable.get(change.table_name).push(change);
-
-      tableCounts[change.table_name] =
-        (tableCounts[change.table_name] || 0) + 1;
-      validEvents++;
-    }
-
-    if (validEvents > 0) {
-      if (!checkOnly) {
-        await targetNode.db.transaction(async (trx) => {
-          await setSessionBypass(targetNode, trx);
-
-          for (const [tableName, tableChanges] of byTable) {
-            await applyTableChanges(targetNode, trx, tableName, tableChanges);
-          }
-
-          if (targetNode.client === "mysql2" || targetNode.client === "mysql") {
-            await trx.raw("SET FOREIGN_KEY_CHECKS = 1;");
-          }
-        });
-        logger.info(
-          `[Range Sync] Synced batch of ${validEvents} records (Total: ${totalRecordsFound + validEvents})`,
-        );
-      } else {
-        logger.info(`[Check Only] Scanned batch of ${validEvents} records...`);
+      for (const change of changes) {
+        if (!ALLOWED_TABLES.has(change.table_name)) continue;
+        if (!byTable.has(change.table_name)) byTable.set(change.table_name, []);
+        byTable.get(change.table_name).push(change);
+        validEvents++;
       }
 
-      totalRecordsFound += validEvents;
+      if (validEvents > 0) {
+        if (!checkOnly) {
+          await targetNode.db.transaction(async (trx) => {
+            await setSessionBypass(targetNode, trx);
+
+            for (const [tableName, tableChanges] of byTable) {
+              await applyTableChanges(targetNode, trx, tableName, tableChanges);
+              tableCounts[tableName] =
+                (tableCounts[tableName] || 0) + tableChanges.length;
+            }
+
+            if (
+              targetNode.client === "mysql2" ||
+              targetNode.client === "mysql"
+            ) {
+              await trx.raw("SET FOREIGN_KEY_CHECKS = 1;");
+            }
+          });
+          totalRecordsFound += validEvents;
+          logger.info(
+            `[Range Sync] Synced batch of ${validEvents} records (Total: ${totalRecordsFound})`,
+          );
+        } else {
+          let batchUnsyncedCount = 0;
+          for (const [tableName, tableChanges] of byTable) {
+            const unsynced = await filterUnsyncedRecords(
+              targetNode,
+              tableName,
+              tableChanges,
+            );
+            if (unsynced.length > 0) {
+              tableCounts[tableName] =
+                (tableCounts[tableName] || 0) + unsynced.length;
+              batchUnsyncedCount += unsynced.length;
+            }
+          }
+          totalRecordsFound += batchUnsyncedCount;
+          logger.info(
+            `[Check Only] Batch scanned: ${batchUnsyncedCount} unsynced/different records found.`,
+          );
+        }
+      }
+
+      lastProcessedId = BigInt(changes[changes.length - 1].change_id);
+      if (changes.length < batchSize) break;
     }
 
-    lastProcessedId = BigInt(changes[changes.length - 1].change_id);
+    console.log("\n===========================================");
+    console.log(` SUMMARY REPORT (${modeText})`);
+    console.log("===========================================");
+    console.log(`Source Node: ${sourceNode.id}`);
+    console.log(`Target Node: ${targetNode.id}`);
+    console.log(
+      `Date Range : ${fromDate.toISOString()} to ${toDate.toISOString()}`,
+    );
+    console.log(`Total Unsynced Events Found: ${totalRecordsFound}`);
+    console.log("-------------------------------------------");
+    console.log("Breakdown by Table:");
 
-    if (changes.length < batchSize) break;
-  }
-
-  console.log("\n===========================================");
-  console.log(` SUMMARY REPORT (${modeText})`);
-  console.log("===========================================");
-  console.log(`Source Node: ${sourceNode.id}`);
-  console.log(`Target Node: ${targetNode.id}`);
-  console.log(
-    `Date Range : ${fromDate.toISOString()} to ${toDate.toISOString()}`,
-  );
-  console.log(`Total Events Found: ${totalRecordsFound}`);
-  console.log("-------------------------------------------");
-  console.log("Breakdown by Table:");
-
-  if (Object.keys(tableCounts).length === 0) {
-    console.log("  No matching records found.");
-  } else {
-    for (const [table, count] of Object.entries(tableCounts)) {
-      console.log(`  - ${table}: ${count} records`);
+    if (Object.keys(tableCounts).length === 0) {
+      console.log("  No unsynced records found.");
+    } else {
+      for (const [table, count] of Object.entries(tableCounts)) {
+        console.log(`  - ${table}: ${count} records`);
+      }
     }
+    console.log("===========================================\n");
+  } finally {
+    await HUB_NODE.db.destroy();
+    await Promise.all(branchNodes.map((b) => b.db.destroy()));
   }
-  console.log("===========================================\n");
 
-  await HUB_NODE.db.destroy();
-  await Promise.all(branchNodes.map((b) => b.db.destroy()));
   process.exit(0);
 }
 
@@ -369,10 +439,10 @@ Usage:
 
 Examples:
   # Dry run / inspection only:
-  node range-sync.js BRANCH_01 NODE_MAIN_HUB "2026-09-01 00:00:00" "2026-09-18 23:59:59" --check-only
+  node range-sync.js NODE_BRANCH_02 NODE_MAIN_HUB "2026-09-01 00:00:00" "2026-09-18 23:59:59" --check-only
 
   # Live sync execution:
-  node range-sync.js BRANCH_01 NODE_MAIN_HUB "2026-09-01 00:00:00" "2026-09-18 23:59:59"
+  node range-sync.js NODE_BRANCH_02 NODE_MAIN_HUB "2026-09-01 00:00:00" "2026-09-18 23:59:59"
   `);
   process.exit(1);
 }
