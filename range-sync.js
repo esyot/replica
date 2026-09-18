@@ -256,15 +256,18 @@ function normalizeVal(val) {
   if (typeof val === "string") {
     const trimmed = val.trim();
 
-    // Safely match Date Strings (e.g., "2026-09-18 00:00:00" or ISO format)
+    // ISO or SQL formatted Date strings (e.g., "2026-09-18 00:00:00", "2026-09-18T00:00:00.000Z")
     if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) {
-      const parsedTime = Date.parse(trimmed.replace(" ", "T"));
+      const dateStr = trimmed.includes("T")
+        ? trimmed
+        : trimmed.replace(" ", "T") + "Z";
+      const parsedTime = Date.parse(dateStr);
       if (!isNaN(parsedTime)) {
         return Math.floor(parsedTime / 1000).toString();
       }
     }
 
-    // Safely match Pure Numbers / Decimals (reject date strings and text)
+    // Numbers / Decimals (ignoring trailing zeros like 10.00 vs 10)
     if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
       const num = Number(trimmed);
       return num.toString();
@@ -319,6 +322,11 @@ async function filterUnsyncedRecords(targetNode, tableName, tableChanges) {
         const normSource = normalizeVal(val);
 
         if (normTarget !== normSource) {
+          logger.info(
+            `[MISMATCH] ${tableName} | col: "${col}" | TargetDB: "${normTarget}" (raw: ${JSON.stringify(
+              targetRow[col],
+            )}) vs Payload: "${normSource}" (raw: ${JSON.stringify(val)})`,
+          );
           modified = true;
           break;
         }
