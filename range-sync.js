@@ -236,53 +236,35 @@ async function applyTableChanges(targetNode, trx, tableName, tableChanges) {
   }
 }
 
+/**
+ * Safe, non-destructive normalizer for DB vs JSON comparisons.
+ */
 function normalizeVal(val) {
+  // 1. Handle Null / Undefined / Empty String
   if (val === null || val === undefined || val === "") return "";
 
-  // Handle JS Date objects
+  // 2. Handle JS Date Objects (from Knex)
   if (val instanceof Date) {
-    return Math.floor(val.getTime() / 1000).toString();
+    return val.toISOString().replace(".000", "");
   }
 
-  // Handle Booleans / TinyInt
+  // 3. Handle Booleans / TinyInt
   if (typeof val === "boolean") return val ? "1" : "0";
   if (val === "true" || val === "TRUE") return "1";
   if (val === "false" || val === "FALSE") return "0";
 
-  // Handle String values
-  if (typeof val === "string") {
-    const trimmed = val.trim();
-
-    // UTC Date Normalization (handles "YYYY-MM-DD HH:MM:SS" and ISO format)
-    if (
-      (trimmed.includes("-") || trimmed.includes("T")) &&
-      !isNaN(Date.parse(trimmed))
-    ) {
-      // Append 'Z' to naive date strings to force consistent UTC parsing
-      const utcString =
-        trimmed.endsWith("Z") || trimmed.includes("+")
-          ? trimmed
-          : trimmed.replace(" ", "T") + "Z";
-      const parsed = Date.parse(utcString);
-      if (!isNaN(parsed)) return Math.floor(parsed / 1000).toString();
-    }
-
-    // Number/Decimal normalization (parseFloat preserves numeric value without strict string formatting issues)
-    if (!isNaN(trimmed) && trimmed !== "") {
-      const num = Number(trimmed);
-      return Number.isInteger(num)
-        ? num.toString()
-        : num.toFixed(4).replace(/\.?0+$/, "");
-    }
-
-    return trimmed;
+  // 4. Handle Numbers / Decimals / Numeric Strings
+  if (
+    typeof val === "number" ||
+    (typeof val === "string" && !isNaN(val) && val.trim() !== "")
+  ) {
+    const num = Number(val);
+    if (!isNaN(num)) return num.toString();
   }
 
-  // Handle numbers / Decimals
-  if (typeof val === "number") {
-    return Number.isInteger(val)
-      ? val.toString()
-      : val.toFixed(4).replace(/\.?0+$/, "");
+  // 5. Handle standard strings (trim whitespace, normalize empty spaces)
+  if (typeof val === "string") {
+    return val.trim();
   }
 
   return String(val);
