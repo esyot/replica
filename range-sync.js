@@ -236,43 +236,53 @@ async function applyTableChanges(targetNode, trx, tableName, tableChanges) {
   }
 }
 
-/**
- * Deep normalization for strict equality checks across raw JSON and Knex DB values.
- */
 function normalizeVal(val) {
   if (val === null || val === undefined || val === "") return "";
 
-  // Handle JavaScript Date objects
+  // Handle JS Date objects
   if (val instanceof Date) {
     return Math.floor(val.getTime() / 1000).toString();
   }
 
-  // Handle boolean / tinyint
+  // Handle Booleans / TinyInt
   if (typeof val === "boolean") return val ? "1" : "0";
   if (val === "true" || val === "TRUE") return "1";
   if (val === "false" || val === "FALSE") return "0";
 
-  // Handle string dates (e.g., "2026-09-18 00:00:00" or ISO strings)
+  // Handle String values
   if (typeof val === "string") {
     const trimmed = val.trim();
+
+    // UTC Date Normalization (handles "YYYY-MM-DD HH:MM:SS" and ISO format)
     if (
       (trimmed.includes("-") || trimmed.includes("T")) &&
       !isNaN(Date.parse(trimmed))
     ) {
-      return Math.floor(Date.parse(trimmed) / 1000).toString();
+      // Append 'Z' to naive date strings to force consistent UTC parsing
+      const utcString =
+        trimmed.endsWith("Z") || trimmed.includes("+")
+          ? trimmed
+          : trimmed.replace(" ", "T") + "Z";
+      const parsed = Date.parse(utcString);
+      if (!isNaN(parsed)) return Math.floor(parsed / 1000).toString();
     }
 
-    // Try parsing string as a number (e.g. "100.00" -> 100)
+    // Number/Decimal normalization (parseFloat preserves numeric value without strict string formatting issues)
     if (!isNaN(trimmed) && trimmed !== "") {
-      return Number(trimmed).toString();
+      const num = Number(trimmed);
+      return Number.isInteger(num)
+        ? num.toString()
+        : num.toFixed(4).replace(/\.?0+$/, "");
     }
 
     return trimmed;
   }
 
-  // Handle numbers / BigInts / Decimals from Knex
+  // Handle numbers / Decimals
   if (typeof val === "number") {
-    return val.toString();
+    return Number.isInteger(val)
+      ? val.toString()
+      : val.toFixed(4).replace(/\.?0+$/, "");
   }
 
   return String(val);
