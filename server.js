@@ -315,7 +315,20 @@ class SyncWorker {
       payload = rawPayloadJson;
     }
 
-    return filterPayloadColumns(change.table_name, payload);
+    const filtered = filterPayloadColumns(change.table_name, payload);
+
+    if (filtered && typeof filtered === "object") {
+      for (const key of Object.keys(filtered)) {
+        if (
+          filtered[key] === "0000-00-00 00:00:00" ||
+          filtered[key] === "0000-00-00"
+        ) {
+          filtered[key] = null;
+        }
+      }
+    }
+
+    return filtered;
   }
 
   async applyTableChanges(trx, tableName, tableChanges) {
