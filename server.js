@@ -290,7 +290,7 @@ class SyncWorker {
     if (client === "pg" || client === "postgres") {
       await trx.raw("SET LOCAL sym.is_syncing = 'true'");
     } else if (client === "mysql2" || client === "mysql") {
-      await trx.raw("SET @sym_is_syncing = TRUE");
+      await trx.raw("SET @sym_is_syncing = TRUE;");
       await trx.raw("SET FOREIGN_KEY_CHECKS = 0;");
     }
   }
@@ -333,19 +333,26 @@ class SyncWorker {
       }
     }
 
-    for (const change of deletes) {
-      const deleteQuery = trx(tableName);
-      if (pkColumns.length === 1) {
-        deleteQuery.where(pkColumns[0], change.primary_key_val);
-      } else {
-        const pkVals = String(change.primary_key_val).split("-");
-        pkColumns.forEach((col, idx) => deleteQuery.where(col, pkVals[idx]));
+    try {
+      for (const change of deletes) {
+        const deleteQuery = trx(tableName);
+        if (pkColumns.length === 1) {
+          deleteQuery.where(pkColumns[0], change.primary_key_val);
+        } else {
+          const pkVals = String(change.primary_key_val).split("-");
+          pkColumns.forEach((col, idx) => deleteQuery.where(col, pkVals[idx]));
+        }
+        await deleteQuery.del();
       }
-      await deleteQuery.del();
-    }
 
-    if (upserts.length > 0) {
-      await trx(tableName).insert(upserts).onConflict(pkColumns).merge();
+      if (upserts.length > 0) {
+        await trx(tableName).insert(upserts).onConflict(pkColumns).merge();
+      }
+    } catch (err) {
+      logger.error(
+        `[DB Sync Error] Table: ${tableName} | Code: ${err.code || "N/A"} | Details: ${err.sqlMessage || err.message}`,
+      );
+      throw err;
     }
   }
 
