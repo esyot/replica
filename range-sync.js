@@ -208,7 +208,7 @@ async function applyTableChanges(targetNode, trx, tableName, tableChanges) {
     } else {
       const payload = decodePayload(change);
       const pkKey = pkColumns.map((col) => payload[col]).join("-");
-      upsertsMap.set(pkKey, payload); // Deduplicate to keep latest state per batch
+      upsertsMap.set(pkKey, payload);
     }
   }
 
@@ -236,6 +236,31 @@ async function applyTableChanges(targetNode, trx, tableName, tableChanges) {
   }
 }
 
+/**
+ * Normalizes values across database engines and JSON payloads for precise equality checks.
+ */
+function normalizeVal(val) {
+  if (val === null || val === undefined) return "";
+
+  if (val instanceof Date) {
+    return Math.floor(val.getTime() / 1000).toString();
+  }
+
+  if (typeof val === "string") {
+    const dateParsed = Date.parse(val);
+    if (!isNaN(dateParsed) && (val.includes("-") || val.includes("T"))) {
+      return Math.floor(dateParsed / 1000).toString();
+    }
+    return val.trim();
+  }
+
+  if (typeof val === "boolean") {
+    return val ? "1" : "0";
+  }
+
+  return String(val);
+}
+
 async function filterUnsyncedRecords(targetNode, tableName, tableChanges) {
   const pkColumns = await getCachedPkColumns(targetNode, tableName);
   if (!pkColumns || pkColumns.length === 0) return tableChanges;
@@ -252,7 +277,13 @@ async function filterUnsyncedRecords(targetNode, tableName, tableChanges) {
     } else {
       const payload = decodePayload(change);
       const query = targetNode.db(tableName);
-      pkColumns.forEach((col) => query.where(col, payload[col]));
+
+      pkColumns.forEach((col) => {
+        if (payload[col] !== undefined) {
+          query.where(col, payload[col]);
+        }
+      });
+
       const targetRow = await query.first();
 
       if (!targetRow) {
@@ -264,13 +295,10 @@ async function filterUnsyncedRecords(targetNode, tableName, tableChanges) {
       for (const [col, val] of Object.entries(payload)) {
         if (targetRow[col] === undefined) continue;
 
-        const targetVal =
-          targetRow[col] instanceof Date
-            ? targetRow[col].toISOString()
-            : targetRow[col];
-        const sourceVal = val instanceof Date ? val.toISOString() : val;
+        const normTarget = normalizeVal(targetRow[col]);
+        const normSource = normalizeVal(val);
 
-        if (String(targetVal) !== String(sourceVal)) {
+        if (normTarget !== normSource) {
           modified = true;
           break;
         }
@@ -427,7 +455,6 @@ async function runRangeSync(
   process.exit(0);
 }
 
-// Parse Command-line arguments:
 const rawArgs = process.argv.slice(2);
 const checkOnly = rawArgs.includes("--check-only");
 const args = rawArgs.filter((arg) => arg !== "--check-only");
