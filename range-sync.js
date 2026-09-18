@@ -237,25 +237,42 @@ async function applyTableChanges(targetNode, trx, tableName, tableChanges) {
 }
 
 /**
- * Normalizes values across database engines and JSON payloads for precise equality checks.
+ * Deep normalization for strict equality checks across raw JSON and Knex DB values.
  */
 function normalizeVal(val) {
-  if (val === null || val === undefined) return "";
+  if (val === null || val === undefined || val === "") return "";
 
+  // Handle JavaScript Date objects
   if (val instanceof Date) {
     return Math.floor(val.getTime() / 1000).toString();
   }
 
+  // Handle boolean / tinyint
+  if (typeof val === "boolean") return val ? "1" : "0";
+  if (val === "true" || val === "TRUE") return "1";
+  if (val === "false" || val === "FALSE") return "0";
+
+  // Handle string dates (e.g., "2026-09-18 00:00:00" or ISO strings)
   if (typeof val === "string") {
-    const dateParsed = Date.parse(val);
-    if (!isNaN(dateParsed) && (val.includes("-") || val.includes("T"))) {
-      return Math.floor(dateParsed / 1000).toString();
+    const trimmed = val.trim();
+    if (
+      (trimmed.includes("-") || trimmed.includes("T")) &&
+      !isNaN(Date.parse(trimmed))
+    ) {
+      return Math.floor(Date.parse(trimmed) / 1000).toString();
     }
-    return val.trim();
+
+    // Try parsing string as a number (e.g. "100.00" -> 100)
+    if (!isNaN(trimmed) && trimmed !== "") {
+      return Number(trimmed).toString();
+    }
+
+    return trimmed;
   }
 
-  if (typeof val === "boolean") {
-    return val ? "1" : "0";
+  // Handle numbers / BigInts / Decimals from Knex
+  if (typeof val === "number") {
+    return val.toString();
   }
 
   return String(val);
