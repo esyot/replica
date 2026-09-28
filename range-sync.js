@@ -4,6 +4,7 @@ const winston = require("winston");
 const crypto = require("crypto");
 
 const { getTablePkColumns, ALLOWED_TABLES } = require("./triggers");
+const { decodeCompositeKey } = require("./pk-codec");
 
 const logger = winston.createLogger({
   level: process.env.NODE_ENV === "production" ? "info" : "debug",
@@ -11,11 +12,20 @@ const logger = winston.createLogger({
     winston.format.timestamp(),
     winston.format.printf(
       ({ timestamp, level, message }) =>
-        `[${timestamp}] [${level.toUpperCase()}]: ${message}`,
+        `[${timestamp}] [pid:${process.pid}] [${level.toUpperCase()}]: ${message}`,
     ),
   ),
   transports: [new winston.transports.Console()],
 });
+
+function parseIntEnv(name, defaultValue, { min, max } = {}) {
+  const raw = process.env[name];
+  let val = raw !== undefined && raw !== "" ? parseInt(raw, 10) : defaultValue;
+  if (Number.isNaN(val)) val = defaultValue;
+  if (min !== undefined) val = Math.max(min, val);
+  if (max !== undefined) val = Math.min(max, val);
+  return val;
+}
 
 let ALLOWED_COLUMNS = {};
 try {
@@ -48,6 +58,21 @@ function normalizeClient(client) {
   return c === "mysql" ? "mysql2" : c;
 }
 
+if (process.env.PAYLOAD_ENCRYPTION_KEY) {
+  let keyBuf;
+  try {
+    keyBuf = Buffer.from(process.env.PAYLOAD_ENCRYPTION_KEY, "hex");
+  } catch {
+    keyBuf = Buffer.alloc(0);
+  }
+  if (keyBuf.length !== 32) {
+    logger.error(
+      "CRITICAL: PAYLOAD_ENCRYPTION_KEY must be 32 bytes (64 hex chars) for aes-256-gcm.",
+    );
+    process.exit(1);
+  }
+}
+
 const hubClient = normalizeClient(process.env.LOCAL_CLIENT);
 const isHubPg = hubClient === "pg" || hubClient === "postgres";
 
@@ -69,7 +94,25 @@ const HUB_NODE = {
   }),
 };
 
-const BRANCHES_CONFIG = JSON.parse(process.env.BRANCHES_JSON || "[]");
+let BRANCHES_CONFIG = [];
+try {
+  BRANCHES_CONFIG = JSON.parse(process.env.BRANCHES_JSON || "[]");
+  if (!Array.isArray(BRANCHES_CONFIG)) {
+    throw new Error("BRANCHES_JSON must be a JSON array");
+  }
+} catch (err) {
+  logger.error(`CRITICAL: Invalid BRANCHES_JSON: ${err.message}`);
+  process.exit(1);
+}
+
+for (const b of BRANCHES_CONFIG) {
+  if (!b.id || !b.url) {
+    logger.error(
+      `CRITICAL: Each entry in BRANCHES_JSON needs "id" and "url". Got: ${JSON.stringify(b)}`,
+    );
+    process.exit(1);
+  }
+}
 
 const branchNodes = BRANCHES_CONFIG.map((b) => {
   const clientName = normalizeClient(b.client);
@@ -134,9 +177,19 @@ class PayloadCipher {
 const PK_CACHE = new Map();
 
 async function getCachedPkColumns(node, tableName) {
+  if (!ALLOWED_TABLES.has(tableName)) {
+    throw new Error(
+      `Refusing to resolve PK columns for disallowed table: ${tableName}`,
+    );
+  }
   const cacheKey = `${node.id}:${tableName}`;
   if (!PK_CACHE.has(cacheKey)) {
     const cols = await getTablePkColumns(node, tableName);
+    if (!cols || cols.length === 0) {
+      throw new Error(
+        `No primary key columns resolved for table: ${tableName}`,
+      );
+    }
     PK_CACHE.set(cacheKey, cols);
   }
   return PK_CACHE.get(cacheKey);
@@ -207,7 +260,7 @@ async function applyTableChanges(targetNode, trx, tableName, tableChanges) {
       deletes.push(change);
     } else {
       const payload = decodePayload(change);
-      const pkKey = pkColumns.map((col) => payload[col]).join("-");
+      const pkKey = JSON.stringify(pkColumns.map((col) => payload[col]));
       upsertsMap.set(pkKey, payload);
     }
   }
@@ -220,43 +273,55 @@ async function applyTableChanges(targetNode, trx, tableName, tableChanges) {
       const idsToDelete = deletes.map((d) => d.primary_key_val);
       await trx(tableName).whereIn(pkCol, idsToDelete).del();
     } else {
-      await Promise.all(
-        deletes.map((change) => {
-          const deleteQuery = trx(tableName);
-          const pkVals = String(change.primary_key_val).split("-");
-          pkColumns.forEach((col, idx) => deleteQuery.where(col, pkVals[idx]));
-          return deleteQuery.del();
-        }),
-      );
+      const chunkSize = parseIntEnv("COMPOSITE_DELETE_CHUNK_SIZE", 200, {
+        min: 1,
+        max: 1000,
+      });
+      for (let i = 0; i < deletes.length; i += chunkSize) {
+        const chunk = deletes.slice(i, i + chunkSize);
+        await trx(tableName)
+          .where(function () {
+            for (const change of chunk) {
+              const pkVals = decodeCompositeKey(
+                change.primary_key_val,
+                pkColumns.length,
+                tableName,
+              );
+              this.orWhere(function () {
+                pkColumns.forEach((col, idx) => {
+                  this.andWhere(col, pkVals[idx]);
+                });
+              });
+            }
+          })
+          .del();
+      }
     }
   }
 
   if (upserts.length > 0) {
     await trx(tableName).insert(upserts).onConflict(pkColumns).merge();
   }
+
+  logger.debug(
+    `[Apply] ${targetNode.id} | ${tableName}: ${upserts.length} upserted, ${deletes.length} deleted`,
+  );
 }
 
-/**
- * Robust value normalizer handling DB/JSON differences safely.
- */
 function normalizeVal(val) {
   if (val === null || val === undefined || val === "") return "";
 
-  // 1. Handle JS Date objects
   if (val instanceof Date) {
     return Math.floor(val.getTime() / 1000).toString();
   }
 
-  // 2. Handle Booleans / TinyInt
   if (typeof val === "boolean") return val ? "1" : "0";
   if (val === "true" || val === "TRUE") return "1";
   if (val === "false" || val === "FALSE") return "0";
 
-  // 3. Handle Strings
   if (typeof val === "string") {
     const trimmed = val.trim();
 
-    // ISO or SQL formatted Date strings (e.g., "2026-09-18 00:00:00", "2026-09-18T00:00:00.000Z")
     if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) {
       const dateStr = trimmed.includes("T")
         ? trimmed
@@ -267,7 +332,6 @@ function normalizeVal(val) {
       }
     }
 
-    // Numbers / Decimals (ignoring trailing zeros like 10.00 vs 10)
     if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
       const num = Number(trimmed);
       return num.toString();
@@ -276,7 +340,6 @@ function normalizeVal(val) {
     return trimmed;
   }
 
-  // 4. Handle Numbers
   if (typeof val === "number") {
     return val.toString();
   }
@@ -292,20 +355,32 @@ async function filterUnsyncedRecords(targetNode, tableName, tableChanges) {
 
   for (const change of tableChanges) {
     if (change.operation === "DELETE") {
-      const pkVals = String(change.primary_key_val).split("-");
+      const pkVals = decodeCompositeKey(
+        change.primary_key_val,
+        pkColumns.length,
+        tableName,
+      );
       const query = targetNode.db(tableName);
       pkColumns.forEach((col, idx) => query.where(col, pkVals[idx]));
       const rowExists = await query.first();
       if (rowExists) unsynced.push(change);
     } else {
       const payload = decodePayload(change);
-      const query = targetNode.db(tableName);
 
-      pkColumns.forEach((col) => {
-        if (payload[col] !== undefined) {
-          query.where(col, payload[col]);
-        }
-      });
+      const missingPkCols = pkColumns.filter(
+        (col) => payload[col] === undefined,
+      );
+      if (missingPkCols.length > 0) {
+        logger.warn(
+          `[Check Only] ${tableName} | change_id ${change.change_id}: payload is missing PK column(s) [${missingPkCols.join(", ")}] ` +
+            `(likely filtered out by ALLOWED_COLUMNS_JSON) — cannot safely check existence, marking as unsynced for manual review.`,
+        );
+        unsynced.push(change);
+        continue;
+      }
+
+      const query = targetNode.db(tableName);
+      pkColumns.forEach((col) => query.where(col, payload[col]));
 
       const targetRow = await query.first();
 
@@ -368,12 +443,19 @@ async function runRangeSync(
     process.exit(1);
   }
 
+  if (fromDate.getTime() > toDate.getTime()) {
+    logger.error(
+      `Invalid range: FROM (${fromDate.toISOString()}) is after TO (${toDate.toISOString()}).`,
+    );
+    process.exit(1);
+  }
+
   const modeText = checkOnly ? "[DRY RUN / CHECK ONLY]" : "[LIVE SYNC]";
   logger.info(
     `[Range Sync] ${modeText} Starting operation: ${sourceNode.id} -> ${targetNode.id} | Between ${fromDate.toISOString()} and ${toDate.toISOString()}`,
   );
 
-  const batchSize = parseInt(process.env.BATCH_SIZE || "500", 10);
+  const batchSize = parseIntEnv("BATCH_SIZE", 500, { min: 1, max: 5000 });
   let lastProcessedId = 0n;
   let totalRecordsFound = 0;
   const tableCounts = {};
@@ -400,12 +482,22 @@ async function runRangeSync(
 
       const byTable = new Map();
       let validEvents = 0;
+      let skippedEvents = 0;
 
       for (const change of changes) {
-        if (!ALLOWED_TABLES.has(change.table_name)) continue;
+        if (!ALLOWED_TABLES.has(change.table_name)) {
+          skippedEvents++;
+          continue;
+        }
         if (!byTable.has(change.table_name)) byTable.set(change.table_name, []);
         byTable.get(change.table_name).push(change);
         validEvents++;
+      }
+
+      if (skippedEvents > 0) {
+        logger.warn(
+          `[Range Sync] Skipped ${skippedEvents} events for disallowed tables`,
+        );
       }
 
       if (validEvents > 0) {
@@ -475,12 +567,15 @@ async function runRangeSync(
       }
     }
     console.log("===========================================\n");
+  } catch (err) {
+    logger.error(`[Range Sync] Fatal error: ${err.stack || err.message}`);
+    process.exitCode = 1;
   } finally {
     await HUB_NODE.db.destroy();
     await Promise.all(branchNodes.map((b) => b.db.destroy()));
   }
 
-  process.exit(0);
+  process.exit(process.exitCode || 0);
 }
 
 const rawArgs = process.argv.slice(2);

@@ -11,6 +11,7 @@ const {
   setupNodeTriggers,
   ALLOWED_TABLES,
 } = require("./triggers");
+const { decodeCompositeKey } = require("./pk-codec");
 
 const logger = winston.createLogger({
   level: process.env.NODE_ENV === "production" ? "info" : "debug",
@@ -18,19 +19,35 @@ const logger = winston.createLogger({
     winston.format.timestamp(),
     winston.format.printf(
       ({ timestamp, level, message }) =>
-        `[${timestamp}] [${level.toUpperCase()}]: ${message}`,
+        `[${timestamp}] [pid:${process.pid}] [${level.toUpperCase()}]: ${message}`,
     ),
   ),
   transports: [new winston.transports.Console()],
 });
 
-const API_SECRET_KEY = process.env.API_SECRET_KEY;
-if (!API_SECRET_KEY) {
-  logger.error("CRITICAL: API_SECRET_KEY missing!");
-  process.exit(1);
+function requireEnv(name) {
+  const val = process.env[name];
+  if (!val) {
+    logger.error(`CRITICAL: ${name} missing in environment!`);
+    process.exit(1);
+  }
+  return val;
 }
 
-const API_SECRET_KEY_BUF = Buffer.from(API_SECRET_KEY);
+function parseIntEnv(name, defaultValue, { min, max } = {}) {
+  const raw = process.env[name];
+  let val = raw !== undefined && raw !== "" ? parseInt(raw, 10) : defaultValue;
+  if (Number.isNaN(val)) val = defaultValue;
+  if (min !== undefined) val = Math.max(min, val);
+  if (max !== undefined) val = Math.min(max, val);
+  return val;
+}
+
+const API_SECRET_KEY = requireEnv("API_SECRET_KEY");
+const API_SECRET_KEY_HASH = crypto
+  .createHash("sha256")
+  .update(API_SECRET_KEY)
+  .digest();
 
 let ALLOWED_COLUMNS = {};
 try {
@@ -87,14 +104,32 @@ const HUB_NODE = {
       : parseConnectionString(process.env.LOCAL_URL),
     pool: {
       min: 4,
-      max: parseInt(process.env.HUB_POOL_MAX || "50", 10),
+      max: parseIntEnv("HUB_POOL_MAX", 50, { min: 1, max: 200 }),
       acquireTimeoutMillis: 5000,
       idleTimeoutMillis: 30000,
     },
   }),
 };
 
-const BRANCHES_CONFIG = JSON.parse(process.env.BRANCHES_JSON || "[]");
+let BRANCHES_CONFIG = [];
+try {
+  BRANCHES_CONFIG = JSON.parse(process.env.BRANCHES_JSON || "[]");
+  if (!Array.isArray(BRANCHES_CONFIG)) {
+    throw new Error("BRANCHES_JSON must be a JSON array");
+  }
+} catch (err) {
+  logger.error(`CRITICAL: Invalid BRANCHES_JSON: ${err.message}`);
+  process.exit(1);
+}
+
+for (const b of BRANCHES_CONFIG) {
+  if (!b.id || !b.url) {
+    logger.error(
+      `CRITICAL: Each entry in BRANCHES_JSON needs "id" and "url". Got: ${JSON.stringify(b)}`,
+    );
+    process.exit(1);
+  }
+}
 
 const branchNodes = BRANCHES_CONFIG.map((b) => {
   const clientName = normalizeClient(b.client);
@@ -122,13 +157,35 @@ const branchNodes = BRANCHES_CONFIG.map((b) => {
 });
 
 const CONFIG = {
-  port: parseInt(process.env.PORT || "3000", 10),
-  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "2000", 10),
-  batchSize: parseInt(process.env.BATCH_SIZE || "500", 10),
+  port: parseIntEnv("PORT", 3000, { min: 1, max: 65535 }),
+  pollIntervalMs: parseIntEnv("POLL_INTERVAL_MS", 2000, { min: 250 }),
+  batchSize: parseIntEnv("BATCH_SIZE", 500, { min: 1, max: 5000 }),
   encryptionKey: process.env.PAYLOAD_ENCRYPTION_KEY || null,
   setupTriggersOnStartup: process.env.SETUP_TRIGGERS_ON_STARTUP === "true",
-  maxBackoffMs: parseInt(process.env.MAX_BACKOFF_MS || "30000", 10),
+  maxBackoffMs: parseIntEnv("MAX_BACKOFF_MS", 30000, { min: 1000 }),
+  checkpointValidationEvery: parseIntEnv("CHECKPOINT_VALIDATION_EVERY", 1, {
+    min: 1,
+  }),
+  compositeDeleteChunkSize: parseIntEnv("COMPOSITE_DELETE_CHUNK_SIZE", 200, {
+    min: 1,
+    max: 1000,
+  }),
 };
+
+if (CONFIG.encryptionKey) {
+  let keyBuf;
+  try {
+    keyBuf = Buffer.from(CONFIG.encryptionKey, "hex");
+  } catch (err) {
+    keyBuf = Buffer.alloc(0);
+  }
+  if (keyBuf.length !== 32) {
+    logger.error(
+      "CRITICAL: PAYLOAD_ENCRYPTION_KEY must be 32 bytes (64 hex chars) for aes-256-gcm.",
+    );
+    process.exit(1);
+  }
+}
 
 class PayloadCipher {
   static decrypt(cipherText, keyHex) {
@@ -195,6 +252,7 @@ async function provisionNode(node) {
       table.string("node_source_id", 50).notNullable();
       table.timestamp("created_at").defaultTo(db.fn.now());
     });
+    logger.info(`[Provision] Created sym_change_log on [${node.id}]`);
   }
 
   const hasCheckpoint = await db.schema.hasTable("sym_checkpoint");
@@ -204,6 +262,7 @@ async function provisionNode(node) {
       table.bigInteger("last_processed_change_id").notNullable();
       table.timestamp("updated_at").defaultTo(db.fn.now());
     });
+    logger.info(`[Provision] Created sym_checkpoint on [${node.id}]`);
   }
 
   if (client === "pg" || client === "postgres") {
@@ -235,9 +294,19 @@ async function provisionNode(node) {
 const PK_CACHE = new Map();
 
 async function getCachedPkColumns(node, tableName) {
+  if (!ALLOWED_TABLES.has(tableName)) {
+    throw new Error(
+      `Refusing to resolve PK columns for disallowed table: ${tableName}`,
+    );
+  }
   const cacheKey = `${node.id}:${tableName}`;
   if (!PK_CACHE.has(cacheKey)) {
     const cols = await getTablePkColumns(node, tableName);
+    if (!cols || cols.length === 0) {
+      throw new Error(
+        `No primary key columns resolved for table: ${tableName}`,
+      );
+    }
     PK_CACHE.set(cacheKey, cols);
   }
   return PK_CACHE.get(cacheKey);
@@ -248,6 +317,7 @@ class SyncWorker {
     this.source = source;
     this.target = target;
     this.isProcessing = false;
+    this.checkpointCallCount = 0;
   }
 
   async getCheckpoint() {
@@ -259,6 +329,14 @@ class SyncWorker {
     let currentCheckpoint = record
       ? BigInt(record.last_processed_change_id)
       : 0n;
+
+    this.checkpointCallCount++;
+    const shouldValidate =
+      this.checkpointCallCount % CONFIG.checkpointValidationEvery === 0;
+
+    if (!shouldValidate) {
+      return currentCheckpoint;
+    }
 
     const maxRow = await this.source
       .db("sym_change_log")
@@ -346,6 +424,29 @@ class SyncWorker {
     return result;
   }
 
+  async bulkDeleteComposite(trx, tableName, pkColumns, deletes) {
+    const chunkSize = CONFIG.compositeDeleteChunkSize;
+    for (let i = 0; i < deletes.length; i += chunkSize) {
+      const chunk = deletes.slice(i, i + chunkSize);
+      await trx(tableName)
+        .where(function () {
+          for (const change of chunk) {
+            const pkVals = decodeCompositeKey(
+              change.primary_key_val,
+              pkColumns.length,
+              tableName,
+            );
+            this.orWhere(function () {
+              pkColumns.forEach((col, idx) => {
+                this.andWhere(col, pkVals[idx]);
+              });
+            });
+          }
+        })
+        .del();
+    }
+  }
+
   async applyTableChanges(trx, tableName, tableChanges) {
     const pkColumns = await getCachedPkColumns(this.target, tableName);
 
@@ -368,25 +469,21 @@ class SyncWorker {
           const idsToDelete = deletes.map((d) => d.primary_key_val);
           await trx(tableName).whereIn(pkCol, idsToDelete).del();
         } else {
-          await Promise.all(
-            deletes.map((change) => {
-              const deleteQuery = trx(tableName);
-              const pkVals = String(change.primary_key_val).split("-");
-              pkColumns.forEach((col, idx) =>
-                deleteQuery.where(col, pkVals[idx]),
-              );
-              return deleteQuery.del();
-            }),
-          );
+          await this.bulkDeleteComposite(trx, tableName, pkColumns, deletes);
         }
       }
 
       if (upserts.length > 0) {
         await trx(tableName).insert(upserts).onConflict(pkColumns).merge();
       }
+
+      logger.debug(
+        `[Apply] ${this.source.id} -> ${this.target.id} | ${tableName}: ${upserts.length} upserted, ${deletes.length} deleted`,
+      );
     } catch (err) {
+      const detail = String(err.sqlMessage || err.message).slice(0, 500);
       logger.error(
-        `[DB Sync Error] Table: ${tableName} | Code: ${err.code || "N/A"} | Details: ${err.sqlMessage || err.message}`,
+        `[DB Sync Error] Table: ${tableName} | Code: ${err.code || "N/A"} | Details: ${detail}`,
       );
       throw err;
     }
@@ -420,12 +517,22 @@ class SyncWorker {
 
       const byTable = new Map();
       let validEventCount = 0;
+      let skippedEventCount = 0;
 
       for (const change of changes) {
-        if (!ALLOWED_TABLES.has(change.table_name)) continue;
+        if (!ALLOWED_TABLES.has(change.table_name)) {
+          skippedEventCount++;
+          continue;
+        }
         if (!byTable.has(change.table_name)) byTable.set(change.table_name, []);
         byTable.get(change.table_name).push(change);
         validEventCount++;
+      }
+
+      if (skippedEventCount > 0) {
+        logger.warn(
+          `[Sync Engine] ${this.source.id} -> ${this.target.id} | Skipped ${skippedEventCount} events for disallowed tables`,
+        );
       }
 
       const lastBatchId = changes[changes.length - 1].change_id;
@@ -436,7 +543,7 @@ class SyncWorker {
       }
 
       logger.info(
-        `[Sync Engine] ${this.source.id} -> ${this.target.id} | Processing ${validEventCount} events...`,
+        `[Sync Engine] ${this.source.id} -> ${this.target.id} | Processing ${validEventCount} events across ${byTable.size} tables (checkpoint -> ${lastBatchId})...`,
       );
 
       await this.target.db.transaction(async (trx) => {
@@ -484,6 +591,11 @@ class BranchSyncManager {
           this.branchToHub.processBatch(),
         ]);
         hadWork = hubMore || branchMore;
+        if (this.consecutiveErrors > 0) {
+          logger.info(
+            `[${this.branchId}] recovered after ${this.consecutiveErrors} consecutive error(s)`,
+          );
+        }
         this.consecutiveErrors = 0;
         this.lastError = null;
       } catch (err) {
@@ -501,12 +613,16 @@ class BranchSyncManager {
 
       if (hadWork && !hadError) continue;
 
-      const delay = hadError
+      const baseDelay = hadError
         ? Math.min(
             this.pollIntervalMs * 2 ** Math.min(this.consecutiveErrors, 6),
             this.maxBackoffMs,
           )
         : this.pollIntervalMs;
+
+      const delay = hadError
+        ? baseDelay * (0.85 + Math.random() * 0.3)
+        : baseDelay;
 
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
@@ -565,9 +681,20 @@ async function flushPendingSyncs(workers) {
 
 const app = express();
 
+if (process.env.TRUST_PROXY === "true") {
+  app.set("trust proxy", 1);
+}
+
 if (ALLOWED_ORIGINS.length > 0) {
   app.use(cors({ origin: ALLOWED_ORIGINS }));
 }
+
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  next();
+});
 
 app.use(
   rateLimit({
@@ -578,15 +705,26 @@ app.use(
   }),
 );
 
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    logger.debug(
+      `[HTTP] ${req.method} ${req.path} ${res.statusCode} ${Date.now() - start}ms (${req.ip})`,
+    );
+  });
+  next();
+});
 
 function requireApiKey(req, res, next) {
   const provided = req.get("x-api-key") || "";
-  const providedBuf = Buffer.from(provided);
-  const isValid =
-    providedBuf.length === API_SECRET_KEY_BUF.length &&
-    crypto.timingSafeEqual(providedBuf, API_SECRET_KEY_BUF);
+  const providedHash = crypto.createHash("sha256").update(provided).digest();
+  const isValid = crypto.timingSafeEqual(providedHash, API_SECRET_KEY_HASH);
   if (!isValid) {
+    logger.warn(
+      `[Auth] Rejected request to ${req.path} from ${req.ip} - invalid API key`,
+    );
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
@@ -653,6 +791,9 @@ let server;
 async function startMultiBranchEngine() {
   try {
     logger.info(`Starting Hub-and-Spoke Engine for Hub [${HUB_NODE.id}]...`);
+    logger.info(
+      `[Config] port=${CONFIG.port} pollIntervalMs=${CONFIG.pollIntervalMs} batchSize=${CONFIG.batchSize} branches=${branchNodes.length} encryptionEnabled=${Boolean(CONFIG.encryptionKey)}`,
+    );
 
     await provisionNode(HUB_NODE);
 
@@ -741,5 +882,13 @@ async function shutdown(signal) {
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
+
+process.on("unhandledRejection", (reason) => {
+  logger.error(`[Unhandled Rejection]: ${reason?.stack || reason}`);
+});
+process.on("uncaughtException", (err) => {
+  logger.error(`[Uncaught Exception]: ${err.stack || err.message}`);
+  shutdown("uncaughtException");
+});
 
 startMultiBranchEngine();

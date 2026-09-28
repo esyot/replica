@@ -88,6 +88,10 @@ async function setupNodeTriggers(node) {
       } else {
         await setupMysqlTriggers(db, node.id, tableName, pkColumns, columns);
       }
+
+      console.log(
+        `[Triggers] '${tableName}' on [${node.id}]: PK=${JSON.stringify(pkColumns)} ${pkColumns.length > 1 ? "(composite, JSON-array encoded)" : "(single-column)"}`,
+      );
     } catch (err) {
       console.error(
         `[Triggers] Error generating triggers for '${tableName}' on [${node.id}]:`,
@@ -102,7 +106,7 @@ async function setupMysqlTriggers(db, nodeId, tableName, pkColumns, columns) {
     if (pkColumns.length === 1) {
       return `CAST(${prefix}.${pkColumns[0]} AS CHAR)`;
     }
-    return `CONCAT_WS('-', ${pkColumns.map((col) => `CAST(${prefix}.${col} AS CHAR)`).join(", ")})`;
+    return `CAST(JSON_ARRAY(${pkColumns.map((col) => `CAST(${prefix}.${col} AS CHAR)`).join(", ")}) AS CHAR)`;
   };
 
   const jsonFields = columns
@@ -127,7 +131,6 @@ async function setupMysqlTriggers(db, nodeId, tableName, pkColumns, columns) {
   await db.raw(`DROP TRIGGER IF EXISTS ??`, [triggerUpdate]);
   await db.raw(`DROP TRIGGER IF EXISTS ??`, [triggerDelete]);
 
-  // INSERT TRIGGER
   await db.raw(
     `
     CREATE TRIGGER ?? 
@@ -143,7 +146,6 @@ async function setupMysqlTriggers(db, nodeId, tableName, pkColumns, columns) {
     [triggerInsert, tableName],
   );
 
-  // UPDATE TRIGGER
   await db.raw(
     `
     CREATE TRIGGER ?? 
@@ -159,7 +161,6 @@ async function setupMysqlTriggers(db, nodeId, tableName, pkColumns, columns) {
     [triggerUpdate, tableName],
   );
 
-  // DELETE TRIGGER
   await db.raw(
     `
     CREATE TRIGGER ?? 
@@ -192,9 +193,7 @@ async function setupPostgresTriggers(
   const pkBuild =
     pkColumns.length === 1
       ? `CAST(target_record.${pkColumns[0]} AS TEXT)`
-      : pkColumns
-          .map((col) => `CAST(target_record.${col} AS TEXT)`)
-          .join(" || '-' || ");
+      : `json_build_array(${pkColumns.map((col) => `CAST(target_record.${col} AS TEXT)`).join(", ")})::text`;
 
   await db.raw(`
     CREATE OR REPLACE FUNCTION ${funcName}()
