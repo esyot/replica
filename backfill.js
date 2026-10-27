@@ -241,10 +241,26 @@ async function findMissing(source, target, table, sinceDate) {
     );
   }
 
-  const srcQ = source.db(table).select([...srcCols, "created_at"]);
-  const tgtQ = target.db(table).select(tgtCols);
+  // Try to include created_at for --since filtering. Fall back if the
+  // table doesn't have it (e.g. Laravel pivot tables like model_has_roles).
+  let srcRows;
+  try {
+    srcRows = await source.db(table).select([...srcCols, "created_at"]);
+  } catch (err) {
+    if (/Unknown column 'created_at'/i.test(err.message)) {
+      // Table has no created_at. Ignore --since for this table and warn.
+      if (sinceDate) {
+        logger.warn(
+          `  [${table}] no created_at column — --since ignored for this table`,
+        );
+      }
+      srcRows = await source.db(table).select(srcCols);
+    } else {
+      throw err;
+    }
+  }
 
-  const [srcRows, tgtRows] = await Promise.all([srcQ, tgtQ]);
+  const tgtRows = await target.db(table).select(tgtCols);
 
   const tgtKeys = new Set();
   for (const r of tgtRows) {
