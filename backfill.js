@@ -5,40 +5,24 @@
  * Modes:
  *   --direction=hub-to-branch    Fill rows hub has that branch doesn't
  *   --direction=branch-to-hub    Fill rows branch has that hub doesn't
- *   --direction=both             Do both (dangerous; requires --confirm)
+ *   --direction=both             Do both (requires --confirm)
  *
  * Which rows:
  *   Default: compare PKs; copy whatever is missing on the target.
  *   --pk-file=path               Only copy PKs listed in this file (one per line)
- *   --since=YYYY-MM-DD           Only copy rows whose created_at >= this date
+ *   --since=YYYY-MM-DD           Only consider source rows whose created_at >= date
  *
  * Safety:
  *   --dry-run (default)          Report only; change nothing
  *   --apply                      Actually write to the target
  *   --branch=ID                  Restrict to a single branch
  *   --tables=t1,t2               Restrict to specific tables
- *   --max-rows=N                 Refuse if any table would copy > N (default 50000)
- *   --allow-phantom-store        Only for branch->hub; allows FK on `store` to be
- *                                present first. Also prints phantom-store check.
+ *   --max-rows=N                 Refuse per-table if would copy > N (default 50000)
  *
  * Exit codes:
  *   0 = all requested copies succeeded
  *   1 = some copies failed
  *   2 = runtime error / refused (safety guard)
- *
- * Examples:
- *   # Dry-run what branch->hub would copy
- *   node backfill.js --direction=branch-to-hub --branch=NODE_BRANCH_03 --dry-run
- *
- *   # Actually copy branch->hub for branch 03
- *   node backfill.js --direction=branch-to-hub --branch=NODE_BRANCH_03 --apply
- *
- *   # Only copy the ~46 rows hub has that branch 03 is missing
- *   node backfill.js --direction=hub-to-branch --branch=NODE_BRANCH_03 --apply
- *
- *   # Only copy specific phantom rows (by PK) from branch 03 to hub
- *   node backfill.js --direction=branch-to-hub --branch=NODE_BRANCH_03 \
- *     --tables=pricing_scheme,stocks_on_hand --since=2026-09-09 --pk-file=/tmp/phantoms.txt --apply
  */
 
 require("dotenv").config();
@@ -90,7 +74,8 @@ for (const a of argv) {
     opts.tables = a
       .slice(9)
       .split(",")
-      .map((s) => s.trim());
+      .map((s) => s.trim())
+      .filter(Boolean);
   else if (a.startsWith("--max-rows="))
     opts.maxRows = parseInt(a.slice(11), 10);
   else if (a.startsWith("--pk-file=")) opts.pkFile = a.slice(10);
@@ -114,15 +99,6 @@ if (opts.direction === "both" && !opts.confirm) {
     "--direction=both requires --confirm (it's bidirectional and can loop if misused)",
   );
   process.exit(2);
-}
-
-if (!opts.apply) {
-  logger.info("[DRY RUN] No changes will be made. Use --apply to write.");
-} else {
-  logger.warn(
-    "[APPLY] Writing to target DBs. Have you stopped server.js? (Ctrl+C within 5s to abort)",
-  );
-  await new Promise((r) => setTimeout(r, 5000));
 }
 
 /* ------------------------------------------------------------------ */
@@ -265,15 +241,11 @@ async function findMissing(source, target, table, sinceDate) {
     );
   }
 
-  // Fetch source PKs. If --since given, only rows created since then.
-  const srcQ = source.db(table).select(srcCols);
-  if (sinceDate && tableHasColumn(source, table, "created_at")) {
-    srcQ.where("created_at", ">=", sinceDate);
-  }
-  const srcRows = await srcQ;
+  const srcQ = source.db(table).select([...srcCols, "created_at"]);
+  const tgtQ = target.db(table).select(tgtCols);
 
-  // Fetch target PKs (all — cheap on PK index).
-  const tgtRows = await target.db(table).select(tgtCols);
+  const [srcRows, tgtRows] = await Promise.all([srcQ, tgtQ]);
+
   const tgtKeys = new Set();
   for (const r of tgtRows) {
     const k = pkKeyFromRow(r, tgtCols);
@@ -282,17 +254,18 @@ async function findMissing(source, target, table, sinceDate) {
 
   const missing = [];
   for (const r of srcRows) {
+    if (sinceDate && r.created_at) {
+      const ca =
+        r.created_at instanceof Date ? r.created_at : new Date(r.created_at);
+      if (!Number.isNaN(ca.getTime()) && ca.getTime() < sinceDate.getTime()) {
+        continue;
+      }
+    }
     const k = pkKeyFromRow(r, srcCols);
     if (k != null && !tgtKeys.has(k)) missing.push(k);
   }
 
   return { missing, srcCols, tgtCols, srcRowCount: srcRows.length };
-}
-
-function tableHasColumn(node, table, col) {
-  return PK_CACHE.has(`${node.id}:${table}:has:${col}`)
-    ? PK_CACHE.get(`${node.id}:${table}:has:${col}`)
-    : true; // we'll just let the query fail gracefully
 }
 
 /* ------------------------------------------------------------------ */
@@ -330,7 +303,6 @@ async function copyRows(source, target, table, keys, pkColumns) {
   for (let i = 0; i < keys.length; i += chunkSize) {
     const chunk = keys.slice(i, i + chunkSize);
 
-    // Fetch source rows for this chunk
     let srcRows;
     try {
       if (pkColumns.length === 1) {
@@ -358,7 +330,6 @@ async function copyRows(source, target, table, keys, pkColumns) {
       continue;
     }
 
-    // Insert into target
     for (let j = 0; j < srcRows.length; j += insertChunk) {
       const rows = srcRows.slice(j, j + insertChunk);
       try {
@@ -378,18 +349,11 @@ async function copyRows(source, target, table, keys, pkColumns) {
 /* Phantom-store pre-check (only for branch->hub)                     */
 /* ------------------------------------------------------------------ */
 
-/**
- * If you're backfilling stocks_on_hand / pricing_scheme / store_user and
- * the target (hub) doesn't have the referenced `store`, those inserts will
- * fail FK checks. This scans for it and warns.
- */
 async function phantomStoreCheck(source, target, table) {
   if (!["stocks_on_hand", "store_user", "pricing_scheme"].includes(table)) {
     return null;
   }
-
   try {
-    // Distinct store IDs referenced by source rows
     const srcStores = await source
       .db(table)
       .distinct("store")
@@ -397,13 +361,11 @@ async function phantomStoreCheck(source, target, table) {
     const srcIds = srcStores.map((r) => r.store).filter(Boolean);
     if (srcIds.length === 0) return null;
 
-    // Which of those exist on target?
     const tgt = await target
       .db("store")
       .select("record_id")
       .whereIn("record_id", srcIds);
     const tgtSet = new Set(tgt.map((r) => r.record_id));
-
     const phantom = srcIds.filter((id) => !tgtSet.has(id));
     if (phantom.length === 0) return null;
 
@@ -415,10 +377,25 @@ async function phantomStoreCheck(source, target, table) {
         `FK checks will fail unless those stores are copied first. ` +
         `Consider also backfilling "store" for these PKs.`,
     };
-  } catch (err) {
-    // Column might not exist; ignore.
+  } catch {
     return null;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Apply-mode smoke delay                                             */
+/* ------------------------------------------------------------------ */
+
+async function applySmokeDelay() {
+  if (!opts.apply) {
+    logger.info("[DRY RUN] No changes will be made. Use --apply to write.");
+    return;
+  }
+  logger.warn(
+    "[APPLY] Writing to target DBs. Have you stopped server.js? " +
+      "(Ctrl+C within 5s to abort)",
+  );
+  await new Promise((r) => setTimeout(r, 5000));
 }
 
 /* ------------------------------------------------------------------ */
@@ -426,6 +403,8 @@ async function phantomStoreCheck(source, target, table) {
 /* ------------------------------------------------------------------ */
 
 async function main() {
+  await applySmokeDelay();
+
   const hub = buildHub();
   const branches = buildBranches(opts.branch);
   if (branches.length === 0) {
@@ -447,7 +426,6 @@ async function main() {
 
   const pkFileSet = opts.pkFile ? loadPkFile(opts.pkFile) : null;
 
-  // Resolve --since to a Date
   let sinceDate = null;
   if (opts.since) {
     const d = new Date(opts.since);
@@ -464,28 +442,15 @@ async function main() {
   for (const branch of branches) {
     logger.info(`=== Branch [${branch.id}] direction=${opts.direction} ===`);
 
-    let source, target;
-    if (opts.direction === "hub-to-branch") {
-      source = hub;
-      target = branch;
-    } else if (opts.direction === "branch-to-hub") {
-      source = branch;
-      target = hub;
-    } else if (opts.direction === "both") {
-      // Both = two passes
-      // Handled below in this loop.
-    } else {
-      logger.error(`bad direction: ${opts.direction}`);
-      process.exit(2);
-    }
-
     const directions =
       opts.direction === "both"
         ? [
             { label: "hub->branch", src: hub, tgt: branch },
             { label: "branch->hub", src: branch, tgt: hub },
           ]
-        : [{ label: opts.direction, src: source, tgt: target }];
+        : opts.direction === "hub-to-branch"
+          ? [{ label: "hub->branch", src: hub, tgt: branch }]
+          : [{ label: "branch->hub", src: branch, tgt: hub }];
 
     for (const dir of directions) {
       logger.info(`--- ${dir.label} ---`);
@@ -524,22 +489,16 @@ async function main() {
             continue;
           }
 
-          // Phantom store check (branch->hub only)
           if (dir.label === "branch->hub") {
             const phantom = await phantomStoreCheck(dir.src, dir.tgt, table);
             if (phantom) {
               logger.warn(`  [${table}] ${phantom.message}`);
-              if (!opts.apply) {
-                logger.warn(
-                  `  [${table}] (dry-run) ${toCopy.length} rows would be copied — but phantom store warning applies`,
-                );
-              }
             }
           }
 
           logger.info(
             `  [${table}] ${toCopy.length} missing row(s) ` +
-              `(source has ${srcCols.length === 1 ? "1 PK" : "composite PK"}, target has ${tgtCols.length} PK col(s))`,
+              `(src PK cols: ${srcCols.join(",")}, tgt PK cols: ${tgtCols.join(",")})`,
           );
 
           if (!opts.apply) {
@@ -594,17 +553,21 @@ async function main() {
   }
 
   console.log("\n=== SUMMARY ===");
-  console.table(
-    summary.map((s) => ({
-      branch: s.branch,
-      direction: s.direction,
-      table: s.table,
-      count: s.count ?? s.attempted,
-      copied: s.copied ?? "-",
-      failed: s.failed ?? "-",
-      status: s.status,
-    })),
-  );
+  if (summary.length === 0) {
+    console.log("Nothing to copy (all tables in parity).");
+  } else {
+    console.table(
+      summary.map((s) => ({
+        branch: s.branch,
+        direction: s.direction,
+        table: s.table,
+        count: s.count ?? s.attempted,
+        copied: s.copied ?? "-",
+        failed: s.failed ?? "-",
+        status: s.status,
+      })),
+    );
+  }
 
   await hub.db.destroy().catch(() => {});
   await Promise.allSettled(branches.map((b) => b.db.destroy()));
