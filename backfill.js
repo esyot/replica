@@ -2,6 +2,10 @@
 /**
  * backfill.js — copy missing rows between hub and branches.
  *
+ * Tables are processed in FK-dependency order (parents first). If a row
+ * still fails due to FK, it's queued and retried after all other tables
+ * are copied — so out-of-order dependencies resolve automatically.
+ *
  * Modes:
  *   --direction=hub-to-branch    Fill rows hub has that branch doesn't
  *   --direction=branch-to-hub    Fill rows branch has that hub doesn't
@@ -16,7 +20,8 @@
  *   --dry-run (default)          Report only; change nothing
  *   --apply                      Actually write to the target
  *   --branch=ID                  Restrict to a single branch
- *   --tables=t1,t2               Restrict to specific tables
+ *   --tables=t1,t2               Restrict to specific tables (order doesn't matter;
+ *                                the tool re-sorts by FK dependency)
  *   --max-rows=N                 Refuse per-table if would copy > N (default 50000)
  *
  * Exit codes:
@@ -47,6 +52,102 @@ const logger = winston.createLogger({
   ),
   transports: [new winston.transports.Console()],
 });
+
+/* ------------------------------------------------------------------ */
+/* FK-dependency ordering (parents before children)                   */
+/* ------------------------------------------------------------------ */
+
+// Root tables first. Each subsequent entry may FK-reference any of the
+// entries above it. Unknown tables are appended (last) — they may still
+// copy correctly if the retry loop rescues FK violations, but ideally
+// every table is listed.
+const TABLE_ORDER = [
+  // --- auth / roles ---
+  "users",
+  "roles",
+  "permissions",
+  // --- core entities ---
+  "store",
+  "store_address",
+  "store_user",
+  "customer",
+  "customer_address",
+  "employees",
+  "supplier",
+  "system",
+  "system_user",
+  "classification",
+  "unit_of_measure",
+  "product_type",
+  "product_category",
+  "product",
+  "product_image",
+  // --- pricing ---
+  "pricing_scheme",
+  "price",
+  "discount",
+  "discount_customer",
+  // --- stock ---
+  "stocks_on_hand",
+  "damaged_stocks_on_hand",
+  "stock_costs",
+  "stock_cost_details",
+  "stock_cost_movement_log",
+  "in_out_stocks",
+  "in_out_stocks_details",
+  "in_out_damaged_stocks",
+  "in_out_damaged_stocks_details",
+  "stock_requests",
+  "stock_request_items",
+  // --- purchasing ---
+  "purchase_order",
+  "purchase_order_details",
+  "purchase_order_receive_details",
+  // --- POS sessions / sales ---
+  "pos_session",
+  "cash_count",
+  "sales_order",
+  "sales_order_details",
+  "sales_order_queue",
+  "sales_payment",
+  "card",
+  "card_transaction",
+  "return_item",
+  "adjustment",
+  "deposit",
+  "layaway",
+  "layaway_item",
+  // --- expenses ---
+  "store_expense",
+  "store_expenses_item",
+  // --- REPA (repair/loan association?) ---
+  "repa_group",
+  "repa_group_schedule",
+  "repa_member",
+  "repa_member_winner",
+  "repa_deposit",
+  "repa_gratis_log",
+  // --- system / misc ---
+  "system_log",
+  "address",
+  "receipt_layouts",
+  "receipt_placeholders",
+  // --- pivot tables (must come last: reference users/roles/permissions) ---
+  "model_has_roles",
+  "model_has_permissions",
+  "role_has_permissions",
+  "user_role",
+];
+
+function sortByDependency(tables) {
+  const orderIndex = new Map(TABLE_ORDER.map((t, i) => [t, i]));
+  return [...tables].sort((a, b) => {
+    const ai = orderIndex.has(a) ? orderIndex.get(a) : 9999;
+    const bi = orderIndex.has(b) ? orderIndex.get(b) : 9999;
+    if (ai !== bi) return ai - bi;
+    return a.localeCompare(b); // stable tiebreak
+  });
+}
 
 /* ------------------------------------------------------------------ */
 /* CLI                                                                */
@@ -241,14 +342,11 @@ async function findMissing(source, target, table, sinceDate) {
     );
   }
 
-  // Try to include created_at for --since filtering. Fall back if the
-  // table doesn't have it (e.g. Laravel pivot tables like model_has_roles).
   let srcRows;
   try {
     srcRows = await source.db(table).select([...srcCols, "created_at"]);
   } catch (err) {
     if (/Unknown column 'created_at'/i.test(err.message)) {
-      // Table has no created_at. Ignore --since for this table and warn.
       if (sinceDate) {
         logger.warn(
           `  [${table}] no created_at column — --since ignored for this table`,
@@ -303,21 +401,33 @@ function loadPkFile(path) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Copy rows                                                          */
+/* Copy rows (with per-row fallback on FK failure)                    */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Copy rows from `source` to `target`.
+ *
+ * Strategy:
+ *  1. Try to insert in chunks (fast path).
+ *  2. If a chunk fails (typically FK), fall back to per-row inserts.
+ *     Rows that fail individually are collected in `deferred` and returned
+ *     so the caller can retry them after other tables have been copied.
+ */
 async function copyRows(source, target, table, keys, pkColumns) {
-  if (keys.length === 0) return { copied: 0, failed: 0, errors: [] };
+  if (keys.length === 0) {
+    return { copied: 0, failed: 0, deferred: [], errors: [] };
+  }
 
   const errors = [];
+  const deferred = [];
   let copied = 0;
   let failed = 0;
 
-  const chunkSize = 200;
+  const fetchChunk = 200;
   const insertChunk = 100;
 
-  for (let i = 0; i < keys.length; i += chunkSize) {
-    const chunk = keys.slice(i, i + chunkSize);
+  for (let i = 0; i < keys.length; i += fetchChunk) {
+    const chunk = keys.slice(i, i + fetchChunk);
 
     let srcRows;
     try {
@@ -346,27 +456,56 @@ async function copyRows(source, target, table, keys, pkColumns) {
       continue;
     }
 
-    for (let j = 0; j < srcRows.length; j += insertChunk) {
-      const rows = srcRows.slice(j, j + insertChunk);
+    // Fast path: chunked insert
+    let chunkRemaining = srcRows;
+    for (let j = 0; j < chunkRemaining.length; j += insertChunk) {
+      const rows = chunkRemaining.slice(j, j + insertChunk);
       try {
         await target.db(table).insert(rows).onConflict(pkColumns).ignore();
         copied += rows.length;
-      } catch (err) {
-        failed += rows.length;
-        errors.push({ chunk: `${i}+${j}`, error: `insert: ${err.message}` });
+      } catch (chunkErr) {
+        // Chunk failed — fall back to per-row to salvage what we can
+        logger.debug(
+          `  [${table}] chunk failed (${chunkErr.message.slice(0, 80)}) — retrying per row`,
+        );
+        for (const row of rows) {
+          try {
+            await target.db(table).insert(row).onConflict(pkColumns).ignore();
+            copied++;
+          } catch (rowErr) {
+            const msg = String(rowErr.message || rowErr);
+            if (/foreign key|FOREIGN KEY|ER_NO_REFERENCED_ROW/i.test(msg)) {
+              // FK failure — defer to retry pass
+              const pk = pkColumns.map((c) => row[c]);
+              deferred.push({
+                pk: pkColumns.length === 1 ? pk[0] : JSON.stringify(pk),
+                pkColumns,
+                row,
+                error: msg,
+              });
+            } else {
+              failed++;
+              errors.push({ table, error: msg.slice(0, 200) });
+            }
+          }
+        }
       }
     }
   }
 
-  return { copied, failed, errors };
+  return { copied, failed, deferred, errors };
 }
 
 /* ------------------------------------------------------------------ */
-/* Phantom-store pre-check (only for branch->hub)                     */
+/* Phantom-store pre-check (informational; retry pass handles it)     */
 /* ------------------------------------------------------------------ */
 
 async function phantomStoreCheck(source, target, table) {
-  if (!["stocks_on_hand", "store_user", "pricing_scheme"].includes(table)) {
+  if (
+    !["stocks_on_hand", "store_user", "pricing_scheme", "pos_session"].includes(
+      table,
+    )
+  ) {
     return null;
   }
   try {
@@ -389,9 +528,9 @@ async function phantomStoreCheck(source, target, table) {
       table,
       phantomStores: phantom,
       message:
-        `Table "${table}" references ${phantom.length} store(s) that do not exist on the target. ` +
-        `FK checks will fail unless those stores are copied first. ` +
-        `Consider also backfilling "store" for these PKs.`,
+        `Table "${table}" references ${phantom.length} store(s) missing on target. ` +
+        `They will be auto-resolved if "store" is also being backfilled; otherwise ` +
+        `those rows will be deferred and reported at the end.`,
     };
   } catch {
     return null;
@@ -428,7 +567,8 @@ async function main() {
     process.exit(2);
   }
 
-  const tables = opts.tables
+  // Filter tables, then sort by FK dependency (parents first).
+  let tables = opts.tables
     ? opts.tables.filter((t) => ALLOWED_TABLES.has(t))
     : [...ALLOWED_TABLES];
 
@@ -439,6 +579,9 @@ async function main() {
       process.exit(2);
     }
   }
+
+  tables = sortByDependency(tables);
+  logger.info(`Copy order (FK-safe): ${tables.join(", ")}`);
 
   const pkFileSet = opts.pkFile ? loadPkFile(opts.pkFile) : null;
 
@@ -470,6 +613,9 @@ async function main() {
 
     for (const dir of directions) {
       logger.info(`--- ${dir.label} ---`);
+
+      // Per-direction: collect deferred rows across all tables, retry at end.
+      const deferredByTable = new Map(); // table -> [{pk, row, error}]
 
       for (const table of tables) {
         try {
@@ -512,10 +658,7 @@ async function main() {
             }
           }
 
-          logger.info(
-            `  [${table}] ${toCopy.length} missing row(s) ` +
-              `(src PK cols: ${srcCols.join(",")}, tgt PK cols: ${tgtCols.join(",")})`,
-          );
+          logger.info(`  [${table}] ${toCopy.length} missing row(s)`);
 
           if (!opts.apply) {
             summary.push({
@@ -535,15 +678,21 @@ async function main() {
             toCopy,
             tgtCols,
           );
+
           logger.info(
-            `  [${table}] copied=${result.copied} failed=${result.failed}`,
+            `  [${table}] copied=${result.copied} failed=${result.failed} deferred=${result.deferred.length}`,
           );
           if (result.failed > 0) {
             anyFailure = true;
-            for (const e of result.errors.slice(0, 5)) {
-              logger.error(`    chunk ${e.chunk}: ${e.error}`);
+            for (const e of result.errors.slice(0, 3)) {
+              logger.error(`    ${e.error}`);
             }
           }
+
+          if (result.deferred.length > 0) {
+            deferredByTable.set(table, result.deferred);
+          }
+
           summary.push({
             branch: branch.id,
             direction: dir.label,
@@ -551,7 +700,11 @@ async function main() {
             attempted: toCopy.length,
             copied: result.copied,
             failed: result.failed,
-            status: result.failed === 0 ? "ok" : "partial",
+            deferred: result.deferred.length,
+            status:
+              result.failed === 0 && result.deferred.length === 0
+                ? "ok"
+                : "partial (will retry deferred)",
           });
         } catch (err) {
           anyFailure = true;
@@ -564,6 +717,51 @@ async function main() {
             status: "error",
           });
         }
+      }
+
+      // --- Retry deferred rows (FK failures from parent missing) ---
+      if (deferredByTable.size > 0) {
+        logger.info(`--- ${dir.label}: retrying deferred rows ---`);
+        let stillDeferred = 0;
+        for (const [table, list] of deferredByTable) {
+          let resolved = 0;
+          for (const item of list) {
+            try {
+              await dir.tgt
+                .db(table)
+                .insert(item.row)
+                .onConflict(item.pkColumns)
+                .ignore();
+              resolved++;
+            } catch (err) {
+              stillDeferred++;
+              logger.error(
+                `  [${table}] STILL FAILING pk=${item.pk}: ${err.message.slice(0, 200)}`,
+              );
+            }
+          }
+          logger.info(
+            `  [${table}] deferred retry: resolved=${resolved} still_deferred=${list.length - resolved}`,
+          );
+          // Update summary row
+          const row = summary.find(
+            (s) =>
+              s.branch === branch.id &&
+              s.direction === dir.label &&
+              s.table === table,
+          );
+          if (row) {
+            row.deferred_resolved = resolved;
+            row.deferred_remaining = list.length - resolved;
+            if (list.length - resolved > 0) {
+              row.status = "partial (some FK unresolved)";
+              anyFailure = true;
+            } else {
+              row.status = "ok (deferred resolved)";
+            }
+          }
+        }
+        if (stillDeferred > 0) anyFailure = true;
       }
     }
   }
@@ -580,6 +778,7 @@ async function main() {
         count: s.count ?? s.attempted,
         copied: s.copied ?? "-",
         failed: s.failed ?? "-",
+        deferred: s.deferred ?? "-",
         status: s.status,
       })),
     );
