@@ -82,8 +82,6 @@ try {
   logger.error(`Invalid ALLOWED_COLUMNS_JSON, ignoring: ${err.message}`);
 }
 
-// Warn if a synced table has no column allowlist — this is a security
-// boundary, not just a filter.
 for (const table of ALLOWED_TABLES) {
   if (!Array.isArray(ALLOWED_COLUMNS[table])) {
     logger.warn(
@@ -141,7 +139,6 @@ function defaultPortFor(client) {
 }
 
 function buildKnexConnection(nodeClient, opts) {
-  // opts: { url, ssl, sslStrict, isBranch }
   if (isPgClient(nodeClient)) {
     return {
       connectionString: opts.url,
@@ -212,7 +209,7 @@ const branchNodes = BRANCHES_CONFIG.map((b) => {
       client: clientName,
       connection: buildKnexConnection(clientName, {
         url: b.url,
-        ssl: true, // branches always pass SSL config; the knex connection respects it
+        ssl: true,
         sslStrict: b.sslInsecure !== true,
       }),
       pool: {
@@ -252,6 +249,18 @@ const CONFIG = {
   }),
   flushMaxIterations: parseIntEnv("FLUSH_MAX_ITERATIONS", 100000, { min: 1 }),
   shutdownTimeoutMs: parseIntEnv("SHUTDOWN_TIMEOUT_MS", 10000, { min: 2000 }),
+
+  // Defer-retry for transient FK failures (cross-batch dependencies)
+  deferMaxAttempts: parseIntEnv("DEFER_MAX_ATTEMPTS", 5, { min: 1, max: 100 }),
+  deferMaxQueueSize: parseIntEnv("DEFER_MAX_QUEUE_SIZE", 10000, { min: 1 }),
+
+  // Dependency-order cache TTL
+  dependencyOrderTtlMs: parseIntEnv("DEPENDENCY_ORDER_TTL_MS", 60000, {
+    min: 1000,
+  }),
+
+  // Health endpoint caching for row-count estimates
+  healthCacheTtlMs: parseIntEnv("HEALTH_CACHE_TTL_MS", 30000, { min: 1000 }),
 };
 
 if (CONFIG.encryptionKey) {
@@ -276,16 +285,13 @@ if (CONFIG.encryptionKey) {
 class PayloadCipher {
   static decrypt(cipherText, keyHex) {
     if (!keyHex || cipherText == null) return cipherText;
-
     let parsed;
     try {
       parsed =
         typeof cipherText === "string" ? JSON.parse(cipherText) : cipherText;
     } catch {
-      // Not valid JSON — if encryption is on, this is unexpected.
       throw new Error("Payload is not a valid encrypted envelope");
     }
-
     if (
       !parsed ||
       typeof parsed !== "object" ||
@@ -293,10 +299,8 @@ class PayloadCipher {
       !parsed.encrypted ||
       !parsed.authTag
     ) {
-      // Looks like plaintext, but encryption is configured — refuse.
       throw new Error("Payload is plaintext but PAYLOAD_ENCRYPTION_KEY is set");
     }
-
     const key = Buffer.from(keyHex, "hex");
     const decipher = crypto.createDecipheriv(
       "aes-256-gcm",
@@ -328,8 +332,7 @@ async function provisionNode(node) {
     }
   }
 
-  const hasChangeLog = await db.schema.hasTable("sym_change_log");
-  if (!hasChangeLog) {
+  if (!(await db.schema.hasTable("sym_change_log"))) {
     await db.schema.createTable("sym_change_log", (table) => {
       table.bigIncrements("change_id").primary();
       table.string("table_name", 100).notNullable();
@@ -342,8 +345,7 @@ async function provisionNode(node) {
     logger.info(`[Provision] Created sym_change_log on [${node.id}]`);
   }
 
-  const hasCheckpoint = await db.schema.hasTable("sym_checkpoint");
-  if (!hasCheckpoint) {
+  if (!(await db.schema.hasTable("sym_checkpoint"))) {
     await db.schema.createTable("sym_checkpoint", (table) => {
       table.string("node_id", 50).primary();
       table.bigInteger("last_processed_change_id").notNullable();
@@ -352,7 +354,6 @@ async function provisionNode(node) {
     logger.info(`[Provision] Created sym_checkpoint on [${node.id}]`);
   }
 
-  // Indexes — idempotent for both clients.
   if (isPgClient(client)) {
     await db.raw(
       "CREATE INDEX IF NOT EXISTS idx_sym_log_sync_poll ON sym_change_log (change_id ASC, node_source_id);",
@@ -368,7 +369,6 @@ async function provisionNode(node) {
     } catch (err) {
       if (!/Duplicate key name/i.test(err.message)) throw err;
     }
-    // MySQL: node_id is primary already, no extra unique index needed.
   }
 
   if (CONFIG.setupTriggersOnStartup) {
@@ -381,10 +381,10 @@ async function provisionNode(node) {
 }
 
 /* ------------------------------------------------------------------ */
-/* PK cache (promise-cached, failure-safe)                            */
+/* PK cache                                                           */
 /* ------------------------------------------------------------------ */
 
-const PK_CACHE = new Map(); // key -> Promise<string[]>
+const PK_CACHE = new Map();
 
 async function getCachedPkColumns(node, tableName) {
   if (!ALLOWED_TABLES.has(tableName)) {
@@ -402,11 +402,128 @@ async function getCachedPkColumns(node, tableName) {
       }
       return cols;
     });
-    // If it rejects, remove from cache so the next call retries.
     promise.catch(() => PK_CACHE.delete(cacheKey));
     PK_CACHE.set(cacheKey, promise);
   }
   return PK_CACHE.get(cacheKey);
+}
+
+/* ------------------------------------------------------------------ */
+/* Dynamic FK-dependency order                                        */
+/* ------------------------------------------------------------------ */
+
+const DEP_ORDER_CACHE = new Map();
+
+async function getDependencyOrder(node, tables) {
+  const cacheKey = node.id;
+  const cached = DEP_ORDER_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.ts < CONFIG.dependencyOrderTtlMs) {
+    const want = new Set(tables);
+    return {
+      order: cached.order.filter((t) => want.has(t)),
+      edges: cached.edges,
+    };
+  }
+
+  const db = node.db;
+  const client = node.client;
+  let rawEdges = [];
+
+  try {
+    if (isMysqlClient(client)) {
+      const res = await db.raw(
+        `SELECT TABLE_NAME AS child, REFERENCED_TABLE_NAME AS parent
+         FROM information_schema.KEY_COLUMN_USAGE
+         WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL`,
+      );
+      rawEdges = (res[0] || res).map((r) => ({
+        child: r.child,
+        parent: r.parent,
+      }));
+    } else if (isPgClient(client)) {
+      const res = await db.raw(
+        `SELECT kcu.table_name AS child, ccu.table_name AS parent
+         FROM information_schema.table_constraints tc
+         JOIN information_schema.key_column_usage kcu
+           ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+         JOIN information_schema.constraint_column_usage ccu
+           ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+         WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = current_schema()`,
+      );
+      rawEdges = (res.rows || []).map((r) => ({
+        child: r.child,
+        parent: r.parent,
+      }));
+    }
+  } catch (err) {
+    logger.warn(
+      `[table-order] FK graph query failed on [${node.id}] (${err.message}) — falling back to alphabetical`,
+    );
+    return { order: [...tables].sort(), edges: new Map() };
+  }
+
+  const inBatch = new Set(tables);
+  const parentsOf = new Map();
+  for (const t of tables) parentsOf.set(t, new Set());
+  for (const e of rawEdges) {
+    if (inBatch.has(e.child) && inBatch.has(e.parent)) {
+      parentsOf.get(e.child).add(e.parent);
+    }
+  }
+
+  const visited = new Set();
+  const visiting = new Set();
+  const order = [];
+  const cyclePaths = [];
+
+  function visit(table, stack) {
+    if (visited.has(table)) return;
+    if (visiting.has(table)) {
+      const idx = stack.indexOf(table);
+      if (idx >= 0) cyclePaths.push(stack.slice(idx).concat([table]));
+      return;
+    }
+    visiting.add(table);
+    stack.push(table);
+    for (const parent of parentsOf.get(table) || []) visit(parent, stack);
+    stack.pop();
+    visiting.delete(table);
+    visited.add(table);
+    order.push(table);
+  }
+
+  for (const t of tables) visit(t, []);
+
+  const realCycles = cyclePaths.filter((c) => new Set(c).size > 1);
+  if (realCycles.length > 0) {
+    const message = realCycles.map((c) => c.join(" -> ")).join("; ");
+    throw new Error(
+      `[table-order] Cross-table FK cycle on [${node.id}]: ${message}. ` +
+        `Cannot order — sync of these tables will fail. Remove the cycle or contact a DBA.`,
+    );
+  }
+
+  for (const t of tables) if (!visited.has(t)) order.push(t);
+
+  const position = new Map(order.map((t, i) => [t, i]));
+  for (const table of order) {
+    for (const parent of parentsOf.get(table) || []) {
+      if (!position.has(parent)) continue;
+      if (position.get(parent) > position.get(table)) {
+        throw new Error(
+          `[table-order] Algorithm bug: ${table} (pos ${position.get(table)}) before parent ${parent} on [${node.id}]`,
+        );
+      }
+    }
+  }
+
+  DEP_ORDER_CACHE.set(cacheKey, { order, edges: parentsOf, ts: Date.now() });
+  return { order, edges: parentsOf };
+}
+
+function clearDependencyOrderCache(nodeId) {
+  if (!nodeId) DEP_ORDER_CACHE.clear();
+  else DEP_ORDER_CACHE.delete(nodeId);
 }
 
 /* ------------------------------------------------------------------ */
@@ -419,13 +536,21 @@ class SyncWorker {
     this.target = target;
     this.isProcessing = false;
     this.checkpointCallCount = 0;
+
+    this.deferred = []; // [{ table, change, attempts }]
+
+    this.halted = false;
+    this.haltReason = null;
+    this.haltedAt = null;
+
     this.stats = {
       appliedEvents: 0,
       skippedEvents: 0,
       quarantinedEvents: 0,
+      deferredEvents: 0,
+      resolvedDeferred: 0,
       batches: 0,
       lastAppliedAt: null,
-      lastQuarantineChangeId: null,
     };
   }
 
@@ -442,25 +567,22 @@ class SyncWorker {
     this.checkpointCallCount++;
     const shouldValidate =
       this.checkpointCallCount % CONFIG.checkpointValidationEvery === 0;
-
     if (!shouldValidate) return currentCheckpoint;
 
     const maxRow = await this.source
       .db("sym_change_log")
       .max("change_id as max_id")
       .first();
-
     const maxSourceId = maxRow?.max_id != null ? BigInt(maxRow.max_id) : 0n;
 
     if (currentCheckpoint > maxSourceId) {
       logger.warn(
         `[Checkpoint Resync] ${this.source.id} -> ${this.target.id}: ` +
-          `Checkpoint (${currentCheckpoint}) is ahead of source max ID (${maxSourceId}). Resetting...`,
+          `checkpoint ${currentCheckpoint} ahead of source max ${maxSourceId}. Resetting.`,
       );
       currentCheckpoint = maxSourceId;
       await this.setCheckpoint(currentCheckpoint);
     }
-
     return currentCheckpoint;
   }
 
@@ -476,15 +598,11 @@ class SyncWorker {
       .merge();
   }
 
-  /**
-   * Apply session-level bypasses. Returns a restore function that MUST be
-   * called in a finally block to avoid leaking state on pooled connections.
-   */
   async setSessionBypass(trx) {
     const client = this.target.client;
     if (isPgClient(client)) {
       await trx.raw("SET LOCAL sym.is_syncing = 'true'");
-      return async () => {}; // SET LOCAL is scoped to the transaction
+      return async () => {};
     }
     if (isMysqlClient(client)) {
       await trx.raw("SET @sym_is_syncing = TRUE;");
@@ -492,16 +610,16 @@ class SyncWorker {
       await trx.raw(
         "SET SESSION sql_mode = REPLACE(REPLACE(@@sql_mode, 'NO_ZERO_DATE', ''), 'NO_ZERO_IN_DATE', '');",
       );
+      let restored = false;
       return async () => {
-        // Restore on the SAME connection (the trx connection). If the trx
-        // already rolled back, these may fail — swallow and log, because the
-        // connection is being returned to the pool and we must not leave
-        // FOREIGN_KEY_CHECKS=0 behind.
+        if (restored) return;
+        restored = true;
         try {
           await trx.raw("SET FOREIGN_KEY_CHECKS = 1;");
+          await trx.raw("SET @sym_is_syncing = NULL;");
         } catch (err) {
-          logger.error(
-            `[SessionBypass] Failed to restore FOREIGN_KEY_CHECKS on ${this.target.id}: ${err.message}`,
+          logger.debug(
+            `[SessionBypass] Restore skipped on ${this.target.id}: ${err.message}`,
           );
         }
       };
@@ -517,7 +635,6 @@ class SyncWorker {
         CONFIG.encryptionKey,
       );
     }
-
     let payload;
     if (typeof rawPayloadJson === "string") {
       try {
@@ -528,25 +645,20 @@ class SyncWorker {
     } else {
       payload = rawPayloadJson;
     }
-
     if (!payload || typeof payload !== "object") return payload;
 
     const allowed = ALLOWED_COLUMNS[change.table_name];
     const targetKeys = Array.isArray(allowed) ? allowed : Object.keys(payload);
     const result = {};
-
     for (const key of targetKeys) {
       if (Object.prototype.hasOwnProperty.call(payload, key)) {
         let val = payload[key];
-        // Anchored match: only null out the sentinel itself, not strings
-        // that merely contain it.
         if (typeof val === "string" && /^0000-00-00(?: 00:00:00)?$/.test(val)) {
           val = null;
         }
         result[key] = val;
       }
     }
-
     return result;
   }
 
@@ -563,9 +675,7 @@ class SyncWorker {
             tableName,
           );
           this.orWhere(function () {
-            pkColumns.forEach((col, idx) => {
-              this.andWhere(col, pkVals[idx]);
-            });
+            pkColumns.forEach((col, idx) => this.andWhere(col, pkVals[idx]));
           });
         }
       });
@@ -575,7 +685,6 @@ class SyncWorker {
 
   async applyTableChanges(trx, tableName, tableChanges) {
     const pkColumns = await getCachedPkColumns(this.target, tableName);
-
     const deletes = [];
     const upserts = [];
 
@@ -583,8 +692,7 @@ class SyncWorker {
       if (change.operation === "DELETE") {
         deletes.push(change);
       } else {
-        const payload = this.decodePayload(change);
-        upserts.push(payload);
+        upserts.push(this.decodePayload(change));
       }
     }
 
@@ -592,7 +700,6 @@ class SyncWorker {
       if (pkColumns.length === 1) {
         const pkCol = pkColumns[0];
         const idsToDelete = deletes.map((d) => d.primary_key_val);
-        // Chunk whereIn to avoid massive IN lists.
         const chunkSize = CONFIG.upsertChunkSize;
         for (let i = 0; i < idsToDelete.length; i += chunkSize) {
           await trx(tableName)
@@ -605,7 +712,6 @@ class SyncWorker {
     }
 
     if (upserts.length > 0) {
-      // Chunk inserts to avoid exceeding driver parameter limits on huge batches.
       const chunkSize = CONFIG.upsertChunkSize;
       for (let i = 0; i < upserts.length; i += chunkSize) {
         await trx(tableName)
@@ -616,16 +722,78 @@ class SyncWorker {
     }
   }
 
-  /**
-   * Process one batch. Returns true if a full batch was processed (more may
-   * be waiting), false otherwise.
-   *
-   * Poison rows: a single row failing to decode/apply no longer stalls the
-   * branch. We log, count, and skip past it (advancing the checkpoint), so
-   * the branch catches up. The quarantined change_id is recorded for
-   * operator inspection.
-   */
+  isDeferrableFkError(err) {
+    const msg = String(err?.message || err || "");
+    return (
+      /ER_NO_REFERENCED_ROW/i.test(msg) ||
+      /Cannot add or update a child row: a foreign key constraint fails/i.test(
+        msg,
+      ) ||
+      /foreign key constraint fails/i.test(msg)
+    );
+  }
+
+  async retryDeferred(trx) {
+    if (this.deferred.length === 0) return { resolved: 0, stillDeferred: [] };
+
+    const tablesInDeferred = [...new Set(this.deferred.map((d) => d.table))];
+    let tableOrder;
+    try {
+      const { order } = await getDependencyOrder(this.target, tablesInDeferred);
+      tableOrder = order;
+    } catch (err) {
+      logger.error(`[Deferred] Order query failed: ${err.message}`);
+      tableOrder = tablesInDeferred;
+    }
+    const orderIdx = new Map(tableOrder.map((t, i) => [t, i]));
+    const sorted = [...this.deferred].sort(
+      (a, b) =>
+        (orderIdx.get(a.table) ?? 9999) - (orderIdx.get(b.table) ?? 9999),
+    );
+
+    const stillDeferred = [];
+    let resolved = 0;
+
+    for (const d of sorted) {
+      try {
+        await this.applyTableChanges(trx, d.table, [d.change]);
+        resolved++;
+        logger.info(
+          `[Deferred] Resolved change_id=${d.change.change_id} table=${d.table} after ${d.attempts} attempt(s)`,
+        );
+      } catch (err) {
+        d.attempts++;
+        if (d.attempts >= CONFIG.deferMaxAttempts) {
+          // HALT — don't quarantine
+          this.halted = true;
+          this.haltReason = `change_id=${d.change.change_id} table=${d.table} failed ${d.attempts} attempts: ${err.message}`;
+          this.haltedAt = new Date();
+          logger.error(
+            `[HALT] ${this.source.id}->${this.target.id}: ${this.haltReason}`,
+          );
+          throw new Error(`Sync halted: ${this.haltReason}`);
+        }
+        stillDeferred.push(d);
+      }
+    }
+
+    return { resolved, stillDeferred };
+  }
+
+  resume() {
+    if (!this.halted) return false;
+    logger.warn(
+      `[${this.source.id}->${this.target.id}] Resuming from halt: ${this.haltReason}`,
+    );
+    this.halted = false;
+    this.haltReason = null;
+    this.haltedAt = null;
+    this.deferred = [];
+    return true;
+  }
+
   async processBatch() {
+    if (this.halted) return false;
     if (this.isProcessing) return false;
     this.isProcessing = true;
 
@@ -647,7 +815,7 @@ class SyncWorker {
         .orderBy("change_id", "asc")
         .limit(CONFIG.batchSize);
 
-      if (changes.length === 0) return false;
+      if (changes.length === 0 && this.deferred.length === 0) return false;
 
       const byTable = new Map();
       let validEventCount = 0;
@@ -670,73 +838,138 @@ class SyncWorker {
         );
       }
 
-      const lastBatchId = changes[changes.length - 1].change_id;
+      const lastBatchId =
+        changes.length > 0
+          ? changes[changes.length - 1].change_id
+          : lastId.toString();
 
-      if (validEventCount === 0) {
-        await this.setCheckpoint(lastBatchId);
+      if (validEventCount === 0 && this.deferred.length === 0) {
+        if (changes.length > 0) await this.setCheckpoint(lastBatchId);
         return changes.length === CONFIG.batchSize;
       }
 
-      logger.debug(
-        `[Sync Engine] ${this.source.id} -> ${this.target.id} | Processing ${validEventCount} events across ${byTable.size} tables (checkpoint -> ${lastBatchId})...`,
-      );
+      // Derive dynamic FK-safe order for batch + deferred
+      const allTables = new Set([
+        ...byTable.keys(),
+        ...this.deferred.map((d) => d.table),
+      ]);
+      let tableOrder;
+      try {
+        const result = await getDependencyOrder(this.target, [...allTables]);
+        tableOrder = result.order;
+      } catch (err) {
+        logger.error(
+          `[Sync Engine] ${this.source.id} -> ${this.target.id} | ` +
+            `FATAL: cannot determine FK order: ${err.message}. Skipping batch.`,
+        );
+        throw err;
+      }
 
-      let restoreSession = async () => {};
       let appliedCount = 0;
-      let quarantineCount = 0;
+      let deferredAdded = 0;
+      let deferredResolved = 0;
 
       try {
         await this.target.db.transaction(async (trx) => {
-          restoreSession = await this.setSessionBypass(trx);
+          let restoreSession = async () => {};
+          try {
+            restoreSession = await this.setSessionBypass(trx);
 
-          for (const [tableName, tableChanges] of byTable) {
-            // Per-table try/catch: a single bad table doesn't roll back the
-            // whole batch. We fall back to per-row apply for that table so
-            // the good rows still land.
-            try {
-              await this.applyTableChanges(trx, tableName, tableChanges);
-              appliedCount += tableChanges.length;
-            } catch (tableErr) {
-              logger.error(
-                `[Sync Engine] Table-level apply failed for ${tableName} ` +
-                  `(${this.source.id} -> ${this.target.id}, change_ids ${tableChanges[0].change_id}..${tableChanges[tableChanges.length - 1].change_id}): ${tableErr.message}. ` +
-                  `Falling back to per-row apply.`,
-              );
-              for (const change of tableChanges) {
-                try {
-                  await this.applyTableChanges(trx, tableName, [change]);
-                  appliedCount++;
-                } catch (rowErr) {
-                  quarantineCount++;
-                  this.stats.lastQuarantineChangeId = change.change_id;
-                  logger.error(
-                    `[Quarantine] change_id=${change.change_id} table=${tableName} op=${change.operation} ` +
-                      `pk=${change.primary_key_val}: ${rowErr.message}`,
-                  );
+            // Phase A: retry deferred
+            if (this.deferred.length > 0) {
+              const r = await this.retryDeferred(trx);
+              deferredResolved = r.resolved;
+              this.deferred = r.stillDeferred;
+            }
+
+            // Phase B: apply new work in FK-safe order
+            for (const tableName of tableOrder) {
+              const tableChanges = byTable.get(tableName);
+              if (!tableChanges || tableChanges.length === 0) continue;
+
+              try {
+                await this.applyTableChanges(trx, tableName, tableChanges);
+                appliedCount += tableChanges.length;
+              } catch (tableErr) {
+                logger.error(
+                  `[Sync Engine] Table apply failed for ${tableName}: ${tableErr.message}. Per-row fallback.`,
+                );
+                for (const change of tableChanges) {
+                  try {
+                    await this.applyTableChanges(trx, tableName, [change]);
+                    appliedCount++;
+                  } catch (rowErr) {
+                    if (this.isDeferrableFkError(rowErr)) {
+                      if (this.deferred.length >= CONFIG.deferMaxQueueSize) {
+                        this.halted = true;
+                        this.haltReason = `Deferred queue full (${CONFIG.deferMaxQueueSize})`;
+                        this.haltedAt = new Date();
+                        logger.error(
+                          `[HALT] ${this.source.id}->${this.target.id}: ${this.haltReason}`,
+                        );
+                        throw new Error(`Sync halted: ${this.haltReason}`);
+                      }
+                      this.deferred.push({
+                        table: tableName,
+                        change,
+                        attempts: 1,
+                      });
+                      deferredAdded++;
+                      logger.warn(
+                        `[Deferred] change_id=${change.change_id} table=${tableName} — FK not satisfied, will retry (queue=${this.deferred.length})`,
+                      );
+                    } else {
+                      // Non-FK error: halt
+                      this.halted = true;
+                      this.haltReason = `change_id=${change.change_id} table=${tableName}: ${rowErr.message}`;
+                      this.haltedAt = new Date();
+                      logger.error(
+                        `[HALT] ${this.source.id}->${this.target.id}: ${this.haltReason}`,
+                      );
+                      throw new Error(`Sync halted: ${this.haltReason}`);
+                    }
+                  }
                 }
               }
             }
-          }
 
-          await this.setCheckpoint(lastBatchId, trx);
+            // Checkpoint: do NOT advance past earliest deferred row
+            const deferredIds = this.deferred
+              .map((d) => BigInt(d.change.change_id))
+              .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+            const checkpointValue =
+              deferredIds.length > 0
+                ? (deferredIds[0] - 1n).toString()
+                : lastBatchId;
+            await this.setCheckpoint(checkpointValue, trx);
+          } finally {
+            try {
+              await restoreSession();
+            } catch (e) {
+              logger.debug(`[SessionBypass] finally: ${e.message}`);
+            }
+          }
         });
-      } finally {
-        // Must run on the same connection the trx used. If the trx already
-        // closed it, this is a no-op with a log — never leaves FK checks off.
-        await restoreSession();
+      } catch (batchErr) {
+        logger.error(`[Sync Engine] Batch aborted: ${batchErr.message}`);
+        return false;
       }
 
       this.stats.appliedEvents += appliedCount;
-      this.stats.quarantinedEvents += quarantineCount;
+      this.stats.deferredEvents += deferredAdded;
+      this.stats.resolvedDeferred += deferredResolved;
       this.stats.batches++;
       this.stats.lastAppliedAt = new Date();
 
       logger.info(
         `[Sync Engine] ${this.source.id} -> ${this.target.id} | Applied ${appliedCount}, ` +
-          `quarantined ${quarantineCount}, skipped ${skippedEventCount} (checkpoint ${lastBatchId})`,
+          `skipped ${skippedEventCount}, deferred +${deferredAdded}/-${deferredResolved} (queue=${this.deferred.length})`,
       );
 
-      return changes.length === CONFIG.batchSize;
+      return (
+        changes.length === CONFIG.batchSize ||
+        (this.deferred.length > 0 && deferredResolved > 0)
+      );
     } finally {
       this.isProcessing = false;
     }
@@ -793,7 +1026,6 @@ class BranchSyncManager {
       if (!this.running) break;
 
       if (hadWork && !hadError) {
-        // Yield to event loop so the process stays responsive under load.
         await new Promise((resolve) => setImmediate(resolve));
         continue;
       }
@@ -804,7 +1036,6 @@ class BranchSyncManager {
             this.maxBackoffMs,
           )
         : this.pollIntervalMs;
-
       const delay = hadError
         ? baseDelay * (0.85 + Math.random() * 0.3)
         : baseDelay;
@@ -824,50 +1055,52 @@ class BranchSyncManager {
       lastRunAt: this.lastRunAt,
       lastError: this.lastError,
       lastErrorAt: this.lastErrorAt,
-      hubToBranch: { ...this.hubToBranch.stats },
-      branchToHub: { ...this.branchToHub.stats },
+      hubToBranch: {
+        ...this.hubToBranch.stats,
+        halted: this.hubToBranch.halted,
+        haltReason: this.hubToBranch.haltReason,
+        haltAt: this.hubToBranch.haltedAt,
+        deferred: this.hubToBranch.deferred.length,
+      },
+      branchToHub: {
+        ...this.branchToHub.stats,
+        halted: this.branchToHub.halted,
+        haltReason: this.branchToHub.haltReason,
+        haltAt: this.branchToHub.haltedAt,
+        deferred: this.branchToHub.deferred.length,
+      },
     };
   }
 }
 
 /* ------------------------------------------------------------------ */
-/* Startup flush (bounded)                                            */
+/* Startup flush                                                      */
 /* ------------------------------------------------------------------ */
 
 async function flushPendingSyncs(workers) {
-  logger.info(
-    "[Startup Sync] Checking and draining pending backlog across all nodes...",
-  );
+  logger.info("[Startup Sync] Draining pending backlog...");
   let batchCount = 0;
   let hasMoreData = true;
 
   while (hasMoreData) {
     if (batchCount >= CONFIG.flushMaxIterations) {
       logger.warn(
-        `[Startup Sync] Reached FLUSH_MAX_ITERATIONS (${CONFIG.flushMaxIterations}); ` +
-          `continuing in background.`,
+        `[Startup Sync] Reached FLUSH_MAX_ITERATIONS (${CONFIG.flushMaxIterations})`,
       );
       break;
     }
-
     const tasks = workers.flatMap((w) => [
       w.hubToBranch.processBatch().catch((err) => {
-        logger.error(
-          `[Flush Error] ${w.branchId} hub->branch: ${err.stack || err.message}`,
-        );
+        logger.error(`[Flush Error] ${w.branchId} hub->branch: ${err.message}`);
         return false;
       }),
       w.branchToHub.processBatch().catch((err) => {
-        logger.error(
-          `[Flush Error] ${w.branchId} branch->hub: ${err.stack || err.message}`,
-        );
+        logger.error(`[Flush Error] ${w.branchId} branch->hub: ${err.message}`);
         return false;
       }),
     ]);
-
     const results = await Promise.all(tasks);
-    hasMoreData = results.some((hasMore) => hasMore === true);
-
+    hasMoreData = results.some((h) => h === true);
     if (hasMoreData) {
       batchCount++;
       if (batchCount % 50 === 0) {
@@ -876,7 +1109,6 @@ async function flushPendingSyncs(workers) {
       await new Promise((resolve) => setImmediate(resolve));
     }
   }
-
   logger.info(`[Startup Sync] Flush complete. Drained ${batchCount} batches.`);
 }
 
@@ -927,9 +1159,7 @@ function requireApiKey(req, res, next) {
     providedHash.length === API_SECRET_KEY_HASH.length &&
     crypto.timingSafeEqual(providedHash, API_SECRET_KEY_HASH);
   if (!valid) {
-    logger.warn(
-      `[Auth] Rejected request to ${req.path} from ${req.ip} - invalid API key`,
-    );
+    logger.warn(`[Auth] Rejected ${req.path} from ${req.ip}`);
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
@@ -937,6 +1167,39 @@ function requireApiKey(req, res, next) {
 
 let syncManagers = [];
 let managerById = new Map();
+
+// Row-count cache for /health (approximate)
+let rowCountCache = { ts: 0, hub: null, branches: new Map() };
+
+async function approximateRowCount(node) {
+  try {
+    const res = await node.db.raw(
+      `SELECT SUM(TABLE_ROWS) AS total
+       FROM information_schema.TABLES
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME IN (?)`,
+      [[...ALLOWED_TABLES]],
+    );
+    const row = (res[0] || res)[0];
+    return Number(row?.total || 0);
+  } catch {
+    return null;
+  }
+}
+
+async function refreshRowCounts() {
+  if (Date.now() - rowCountCache.ts < CONFIG.healthCacheTtlMs)
+    return rowCountCache;
+  const hub = await approximateRowCount(HUB_NODE);
+  const branches = new Map();
+  await Promise.all(
+    branchNodes.map(async (b) => {
+      branches.set(b.id, await approximateRowCount(b));
+    }),
+  );
+  rowCountCache = { ts: Date.now(), hub, branches };
+  return rowCountCache;
+}
 
 app.get("/health", requireApiKey, async (req, res) => {
   let hubMaxChangeId = null;
@@ -946,32 +1209,56 @@ app.get("/health", requireApiKey, async (req, res) => {
       .first();
     hubMaxChangeId = row?.m != null ? BigInt(row.m) : 0n;
   } catch (err) {
-    logger.error(`[Health] Failed to read hub max change_id: ${err.message}`);
+    logger.error(`[Health] hub max change_id failed: ${err.message}`);
   }
+
+  const counts = await refreshRowCounts();
 
   const branchStatus = await Promise.all(
     branchNodes.map(async (branch) => {
       const manager = managerById.get(branch.id);
+      const h2b = manager?.hubToBranch;
+      const b2h = manager?.branchToHub;
       try {
         const lastCheck = await HUB_NODE.db("sym_checkpoint")
           .where("node_id", branch.id)
           .first();
-
         const lastProcessed = lastCheck?.last_processed_change_id
           ? BigInt(lastCheck.last_processed_change_id)
           : 0n;
-
         const lag =
           hubMaxChangeId != null
             ? (hubMaxChangeId - lastProcessed).toString()
             : null;
+
+        const hubToBranchLag =
+          hubMaxChangeId != null ? hubMaxChangeId - lastProcessed : null;
+        const branchToHubLag = null; // could compute similar way
+
+        const isHalted = h2b?.halted || b2h?.halted;
 
         return {
           branchId: branch.id,
           status: "CONNECTED",
           lastProcessedChangeId: lastProcessed.toString(),
           hubToBranchLag: lag,
-          healthy: manager ? manager.consecutiveErrors === 0 : false,
+          rowCounts: {
+            hub: counts.hub,
+            branch: counts.branches.get(branch.id),
+          },
+          deferredQueueDepth: {
+            hubToBranch: h2b?.deferred.length ?? 0,
+            branchToHub: b2h?.deferred.length ?? 0,
+          },
+          halted: {
+            hubToBranch: h2b?.halted ?? false,
+            branchToHub: b2h?.halted ?? false,
+            reason: h2b?.haltReason || b2h?.haltReason || null,
+            at: h2b?.haltedAt || b2h?.haltedAt || null,
+          },
+          healthy: manager
+            ? manager.consecutiveErrors === 0 && !isHalted
+            : false,
           consecutiveErrors: manager?.consecutiveErrors ?? null,
           lastError: manager?.lastError ?? null,
           lastErrorAt: manager?.lastErrorAt ?? null,
@@ -984,19 +1271,46 @@ app.get("/health", requireApiKey, async (req, res) => {
           status: "OFFLINE/UNREACHABLE",
           error: err.message,
           healthy: false,
-          consecutiveErrors: manager?.consecutiveErrors ?? null,
         };
       }
     }),
   );
 
   const allHealthy = branchStatus.every((b) => b.healthy !== false);
+  const anyHalted = branchStatus.some(
+    (b) => b.halted?.hubToBranch || b.halted?.branchToHub,
+  );
+  const totalDeferred = branchStatus.reduce(
+    (s, b) =>
+      s +
+      (b.deferredQueueDepth?.hubToBranch || 0) +
+      (b.deferredQueueDepth?.branchToHub || 0),
+    0,
+  );
 
   res.json({
     hub: HUB_NODE.id,
-    healthy: allHealthy,
+    healthy: allHealthy && !anyHalted,
+    anyHalted,
     activeBranches: branchStatus.length,
+    totalDeferredRows: totalDeferred,
     branches: branchStatus,
+  });
+});
+
+app.post("/resume/:branchId", requireApiKey, (req, res) => {
+  const manager = managerById.get(req.params.branchId);
+  if (!manager) {
+    return res.status(404).json({ error: "branch not found" });
+  }
+  const hubResumed = manager.hubToBranch.resume();
+  const branchResumed = manager.branchToHub.resume();
+  logger.warn(
+    `[Resume] Branch [${req.params.branchId}] hub->branch=${hubResumed} branch->hub=${branchResumed}`,
+  );
+  res.json({
+    branchId: req.params.branchId,
+    resumed: { hubToBranch: hubResumed, branchToHub: branchResumed },
   });
 });
 
@@ -1013,7 +1327,8 @@ async function startMultiBranchEngine() {
     logger.info(
       `[Config] port=${CONFIG.port} pollIntervalMs=${CONFIG.pollIntervalMs} ` +
         `batchSize=${CONFIG.batchSize} branches=${branchNodes.length} ` +
-        `encryptionEnabled=${Boolean(CONFIG.encryptionKey)}`,
+        `encryptionEnabled=${Boolean(CONFIG.encryptionKey)} ` +
+        `deferMaxAttempts=${CONFIG.deferMaxAttempts}`,
     );
 
     await provisionNode(HUB_NODE);
@@ -1023,12 +1338,10 @@ async function startMultiBranchEngine() {
     for (const branch of branchNodes) {
       try {
         await provisionNode(branch);
-        logger.info(
-          `[Startup] Provisioned schema and settings for branch: [${branch.id}]`,
-        );
+        logger.info(`[Startup] Provisioned branch [${branch.id}]`);
       } catch (err) {
         logger.warn(
-          `[Startup] Branch [${branch.id}] unreachable during startup provisioning: ${err.message}`,
+          `[Startup] Branch [${branch.id}] provisioning failed: ${err.message}`,
         );
       }
 
@@ -1055,15 +1368,11 @@ async function startMultiBranchEngine() {
 
     syncManagers.forEach((m) => {
       m.loop().catch((err) => {
-        logger.error(
-          `[Fatal Branch Loop Error] ${m.branchId}: ${err.stack || err.message}`,
-        );
+        logger.error(`[Fatal Branch Loop Error] ${m.branchId}: ${err.stack}`);
       });
     });
 
-    logger.info(
-      `All ${syncManagers.length} branch sync loops launched independently.`,
-    );
+    logger.info(`All ${syncManagers.length} branch sync loops launched.`);
   } catch (err) {
     logger.error(`[Fatal Hub Engine Error]: ${err.stack}`);
     process.exit(1);
@@ -1072,7 +1381,7 @@ async function startMultiBranchEngine() {
 
 async function shutdown(signal) {
   if (isShuttingDown) {
-    logger.info("Forced shutdown requested. Exiting now.");
+    logger.info("Forced shutdown requested.");
     process.exit(1);
   }
   isShuttingDown = true;
@@ -1104,7 +1413,7 @@ async function shutdown(signal) {
   results.forEach((r, i) => {
     if (r.status === "rejected") {
       logger.error(
-        `Error closing branch [${branchNodes[i].id}] DB connections: ${r.reason?.message}`,
+        `Error closing branch [${branchNodes[i].id}]: ${r.reason?.message}`,
       );
     }
   });
