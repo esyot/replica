@@ -2,37 +2,39 @@
 /**
  * node-copy.js — the single ops tool. Modes:
  *
- *   --ping               Reachability check (SELECT 1 with timeout)
- *   --verify             Compare hub vs branches (PK + content). Read-only.
- *   --verify-fk          Compare FK graphs across nodes. Read-only.
- *   --verify-fk-orphans  Scan for orphaned FK references. Read-only.
- *   --fix-logs           Relabel mislabeled sym_change_log entries.
- *   --reseed             Copy one node's data to one or all others (destructive).
- *   --reconcile          Score nodes, pick healthiest, reseed (destructive).
+ *   --ping               Reachability check
+ *   --verify             Compare hub vs branches (PK + content)
+ *   --verify-fk          Compare FK graphs across nodes
+ *   --verify-fk-orphans  Scan for orphaned FK references
+ *   --fix-logs           Relabel mislabeled sym_change_log entries
+ *   --reseed             Full destructive copy (all nodes reset)
+ *   --new-branch         Provision a NEW branch from an existing node
+ *                        (safe while other branches are live)
  *
- * Common flags:
- *   --from=ID --to=ID|all    For --reseed: source and target(s)
- *   --trust=ID|hub           For --reconcile: force source (skip auto-pick)
- *   --apply                  Actually write (default is dry-run)
- *   --tables=t1,t2           Restrict to specific tables
- *   --enrich-tables=t1,t2    For --reconcile: pull unique rows from these tables only
- *   --skip-triggers          Skip drop/rebuild triggers
- *   --keep-log               Don't truncate sym_change_log after reseed
- *   --keep-checkpoint        Don't truncate sym_checkpoint after reseed
- *   --no-backup              Skip backup phase
- *   --skip-preflight         Skip safety pre-checks
- *   --full / --no-full       For --verify: compare row content (default: on)
- *   --max-report=N           For --verify: cap samples (default 50)
+ * NEW: --new-branch copies source data (excluding sync tables), sets up
+ * the new branch's own store + zero stocks + store_user, sets checkpoint
+ * so hub doesn't replay history, and rebuilds triggers. The new store
+ * row syncs to hub via the branch's own log. Other branches are untouched.
  *
- * Env:
- *   CHECK_TIMEOUT_MS         Ping timeout per node (default 3000)
- *   RESEED_TIMEOUT_MS        Dump/load phase timeout (default 300000)
- *   BACKUP_DIR               Backups location (default ./backups/)
- *   BACKUP_RETENTION_DAYS    Auto-delete older backups (default 7)
+ * Usage examples:
+ *   node node-copy.js --ping
+ *   node node-copy.js --verify
+ *   node node-copy.js --verify-fk-orphans
+ *   node node-copy.js --reseed --from=NODE_MAIN_HUB --to=all --apply
+ *   node node-copy.js --new-branch --from=NODE_MAIN_HUB --to=NODE_BRANCH_03 \
+ *     --store-name="BRANCH 03" --store-address="Poblacion, Manga" \
+ *     --store-contact="0917-123-4567" --store-contact-person="Maria" \
+ *     --apply
+ *
+ * Env (optional):
+ *   CHECK_TIMEOUT_MS       Ping timeout (default 3000)
+ *   RESEED_TIMEOUT_MS      Dump/load timeout (default 300000)
+ *   BACKUP_DIR             Backups dir (default ./backups/)
+ *   BACKUP_RETENTION_DAYS  Auto-delete old backups (default 7)
  *
  * Requires: mysqldump and mysql on PATH. MySQL/MariaDB only.
  *
- * Exit: 0 = success / clean / all online; 1 = partial / drift found; 2 = fatal
+ * Exit: 0 = success; 1 = partial/drift; 2 = fatal/refused
  */
 
 require("dotenv").config();
@@ -44,6 +46,7 @@ const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
 const os = require("os");
+const crypto = require("crypto");
 
 const {
   setupNodeTriggers,
@@ -103,6 +106,15 @@ const opts = {
   skipPreflight: false,
   trust: null,
   minScoreDelta: 0.15,
+  // new-branch specific
+  storeName: null,
+  storeAddress: null,
+  storeContact: null,
+  storeContactPerson: null,
+  storeOtherInfo: null,
+  storeUuid: null,
+  storeUsers: null,
+  primaryUser: null,
 };
 
 for (const a of argv) {
@@ -119,6 +131,7 @@ for (const a of argv) {
   else if (a === "--verify-fk-orphans") opts.mode = "verify-fk-orphans";
   else if (a === "--fix-logs") opts.mode = "fix-logs";
   else if (a === "--reseed") opts.mode = "reseed";
+  else if (a === "--new-branch") opts.mode = "new-branch";
   else if (a === "--reconcile") opts.mode = "reconcile";
   else if (a === "--full") opts.full = true;
   else if (a === "--no-full") opts.full = false;
@@ -141,6 +154,21 @@ for (const a of argv) {
     opts.maxReport = parseInt(a.slice(13), 10);
   else if (a.startsWith("--min-score-delta="))
     opts.minScoreDelta = parseFloat(a.slice(18));
+  else if (a.startsWith("--store-name=")) opts.storeName = a.slice(13);
+  else if (a.startsWith("--store-address=")) opts.storeAddress = a.slice(16);
+  else if (a.startsWith("--store-contact=")) opts.storeContact = a.slice(16);
+  else if (a.startsWith("--store-contact-person="))
+    opts.storeContactPerson = a.slice(23);
+  else if (a.startsWith("--store-other-info="))
+    opts.storeOtherInfo = a.slice(19);
+  else if (a.startsWith("--store-uuid=")) opts.storeUuid = a.slice(13);
+  else if (a.startsWith("--store-users="))
+    opts.storeUsers = a
+      .slice(14)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  else if (a.startsWith("--primary-user=")) opts.primaryUser = a.slice(15);
   else {
     logger.error(`Unknown arg: ${a}`);
     process.exit(2);
@@ -151,13 +179,25 @@ if (!opts.mode) {
   if (opts.to || opts.from) opts.mode = "reseed";
   else {
     logger.error(
-      "Mode required: --ping | --verify | --verify-fk | --verify-fk-orphans | --fix-logs | --reseed | --reconcile",
+      "Mode required: --ping | --verify | --verify-fk | --verify-fk-orphans | --fix-logs | --reseed | --new-branch | --reconcile",
     );
     process.exit(2);
   }
 }
 
-const WRITE_MODES = new Set(["reseed", "reconcile", "fix-logs"]);
+// Validate new-branch args
+if (opts.mode === "new-branch") {
+  if (!opts.to) {
+    logger.error("--new-branch requires --to=<branch_id>");
+    process.exit(2);
+  }
+  if (!opts.storeName) {
+    logger.error("--new-branch requires --store-name=<name>");
+    process.exit(2);
+  }
+}
+
+const WRITE_MODES = new Set(["reseed", "reconcile", "fix-logs", "new-branch"]);
 const isWriteMode = WRITE_MODES.has(opts.mode);
 
 if (!opts.apply && isWriteMode) {
@@ -169,11 +209,13 @@ if (!opts.apply && isWriteMode) {
   );
 } else if (
   opts.apply &&
-  (opts.mode === "reseed" || opts.mode === "reconcile")
+  (opts.mode === "reseed" ||
+    opts.mode === "reconcile" ||
+    opts.mode === "new-branch")
 ) {
   logger.warn(
     "==================================================================\n" +
-      "  APPLY MODE — this will WIPE the target node(s).\n" +
+      "  APPLY MODE — this will modify data.\n" +
       "  Ctrl+C within 10 seconds to abort.\n" +
       "==================================================================",
   );
@@ -282,7 +324,7 @@ function buildNode(conn, id) {
 }
 
 /* ------------------------------------------------------------------ */
-/* MySQL defaults file (passwords not on CLI)                        */
+/* MySQL defaults file                                                */
 /* ------------------------------------------------------------------ */
 
 const tempFiles = new Set();
@@ -339,7 +381,7 @@ async function pickSourceInteractively(nodes) {
   });
   while (true) {
     const answer = await prompt(
-      `Which node should be the SOURCE (1-${nodes.length})? `,
+      `Which node should be SOURCE (1-${nodes.length})? `,
     );
     const idx = parseInt(answer, 10);
     if (!Number.isNaN(idx) && idx >= 1 && idx <= nodes.length) {
@@ -351,7 +393,7 @@ async function pickSourceInteractively(nodes) {
 
 async function confirmApply(targets, extraMessage = "") {
   logger.info("");
-  logger.info("About to WIPE data tables on:");
+  logger.info("About to modify data on:");
   targets.forEach((t) => logger.info(`  - ${t.id || t}`));
   if (extraMessage) logger.info(`\n${extraMessage}`);
   logger.info("");
@@ -415,7 +457,7 @@ function cleanupOldBackups() {
 }
 
 /* ------------------------------------------------------------------ */
-/* FK-safe order (queries information_schema)                        */
+/* FK-safe order                                                      */
 /* ------------------------------------------------------------------ */
 
 async function getDependencyOrder(node, tables) {
@@ -486,6 +528,218 @@ function resolveTables() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Subprocess helpers                                                 */
+/* ------------------------------------------------------------------ */
+
+async function runDumpExcluding(conn, tables, excludeTables, outFile) {
+  const defaultsFile = makeDefaultsFile(conn);
+  const args = [
+    `--defaults-extra-file=${defaultsFile}`,
+    "--single-transaction",
+    "--routines=false",
+    "--triggers=false",
+    ...excludeTables.map((t) => `--ignore-table=${conn.database}.${t}`),
+    conn.database,
+    ...tables,
+  ];
+  return new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(outFile);
+    const p = spawnTracked("mysqldump", args, {
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    p.stdout.pipe(out);
+    p.on("close", (code) => {
+      try {
+        fs.unlinkSync(defaultsFile);
+        tempFiles.delete(defaultsFile);
+      } catch {
+        /* ignore */
+      }
+      code === 0 ? resolve() : reject(new Error(`mysqldump exit ${code}`));
+    });
+    p.on("error", reject);
+  });
+}
+
+async function restoreFromFile(conn, dumpFile) {
+  const defaultsFile = makeDefaultsFile(conn);
+  return new Promise((resolve, reject) => {
+    const p = spawnTracked(
+      "mysql",
+      [`--defaults-extra-file=${defaultsFile}`, conn.database],
+      { stdio: ["pipe", "inherit", "inherit"] },
+    );
+    const input = fs.createReadStream(dumpFile);
+    input.pipe(p.stdin);
+    p.on("close", (code) => {
+      try {
+        fs.unlinkSync(defaultsFile);
+        tempFiles.delete(defaultsFile);
+      } catch {
+        /* ignore */
+      }
+      code === 0 ? resolve() : reject(new Error(`mysql exit ${code}`));
+    });
+    p.on("error", reject);
+  });
+}
+
+async function pipeDump(src, tgt, tables) {
+  const srcDefaults = makeDefaultsFile(src);
+  const tgtDefaults = makeDefaultsFile(tgt);
+  const dumpArgs = [
+    `--defaults-extra-file=${srcDefaults}`,
+    "--single-transaction",
+    "--no-create-info",
+    "--routines=false",
+    "--triggers=false",
+    "--extended-insert",
+    "--complete-insert",
+    src.database,
+    ...tables,
+  ];
+  const loadArgs = [`--defaults-extra-file=${tgtDefaults}`, tgt.database];
+
+  return new Promise((resolve, reject) => {
+    const d = spawnTracked("mysqldump", dumpArgs, {
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    const l = spawnTracked("mysql", loadArgs, {
+      stdio: ["pipe", "inherit", "inherit"],
+    });
+    d.stdout.pipe(l.stdin);
+    const cleanup = () => {
+      for (const f of [srcDefaults, tgtDefaults]) {
+        try {
+          fs.unlinkSync(f);
+          tempFiles.delete(f);
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+    let dc = null,
+      lc = null;
+    const tryDone = () => {
+      if (dc === null || lc === null) return;
+      cleanup();
+      if (dc !== 0) return reject(new Error(`mysqldump exit ${dc}`));
+      if (lc !== 0) return reject(new Error(`mysql exit ${lc}`));
+      resolve();
+    };
+    d.on("close", (c) => {
+      dc = c;
+      tryDone();
+    });
+    l.on("close", (c) => {
+      lc = c;
+      tryDone();
+    });
+    d.on("error", (err) => {
+      cleanup();
+      reject(err);
+    });
+    l.on("error", (err) => {
+      cleanup();
+      reject(err);
+    });
+  });
+}
+
+async function dropTriggersOnTarget(tgtConn) {
+  const db = buildKnexFor(tgtConn);
+  try {
+    const r = await db.raw(
+      `SELECT TRIGGER_NAME FROM information_schema.TRIGGERS
+       WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME LIKE 'sym_trig_%'`,
+    );
+    const list = r[0] || r;
+    for (const t of list) {
+      await db.raw(`DROP TRIGGER IF EXISTS \`${t.TRIGGER_NAME}\``);
+    }
+    return list.length;
+  } finally {
+    await db.destroy();
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Preflight                                                          */
+/* ------------------------------------------------------------------ */
+
+async function preflight(source, targets, tables) {
+  logger.info("Pre-flight checks...");
+  try {
+    execSync("which mysqldump", { stdio: "ignore" });
+    execSync("which mysql", { stdio: "ignore" });
+  } catch {
+    throw new Error("mysqldump or mysql not found on PATH");
+  }
+
+  for (const n of [source, ...targets]) {
+    const db = buildKnexFor(parseMysqlUrl(n.url));
+    try {
+      const recent = await db("sym_change_log")
+        .where("created_at", ">", new Date(Date.now() - 60000))
+        .count("* as c")
+        .first();
+      if (Number(recent?.c || 0) > 0) {
+        throw new Error(
+          `[${n.id}] has recent log entries — sync appears RUNNING. Stop pm2 first.`,
+        );
+      }
+    } catch (err) {
+      if (/RUNNING/.test(err.message)) throw err;
+    } finally {
+      await db.destroy().catch(() => {});
+    }
+  }
+
+  const srcDb = buildKnexFor(parseMysqlUrl(source.url));
+  const srcTables = await srcDb.raw(
+    `SELECT TABLE_NAME FROM information_schema.TABLES
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'`,
+  );
+  const srcSet = new Set((srcTables[0] || srcTables).map((r) => r.TABLE_NAME));
+  const missingOnSource = tables.filter((t) => !srcSet.has(t));
+  if (missingOnSource.length > 0) {
+    throw new Error(`Source missing tables: ${missingOnSource.join(", ")}`);
+  }
+  let totalRows = 0;
+  for (const t of tables) {
+    try {
+      const c = await srcDb(t).count("* as c").first();
+      totalRows += Number(c?.c || 0);
+    } catch {
+      /* ignore */
+    }
+  }
+  if (totalRows === 0) throw new Error("Source has 0 rows — refusing");
+  await srcDb.destroy();
+
+  for (const tgt of targets) {
+    const tgtDb = buildKnexFor(parseMysqlUrl(tgt.url));
+    const tgtTables = await tgtDb.raw(
+      `SELECT TABLE_NAME FROM information_schema.TABLES
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'`,
+    );
+    const tgtSet = new Set(
+      (tgtTables[0] || tgtTables).map((r) => r.TABLE_NAME),
+    );
+    const missing = tables.filter((t) => !tgtSet.has(t));
+    if (missing.length > 0) {
+      throw new Error(
+        `Target [${tgt.id}] missing tables: ${missing.join(", ")}`,
+      );
+    }
+    await tgtDb.destroy();
+  }
+  logger.info(
+    `Pre-flight OK (source ${totalRows} rows, ${tables.length} tables)`,
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* MODE: ping                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -530,11 +784,8 @@ async function ping(nodes) {
     })),
   );
   const online = results.filter((r) => r.status === "ONLINE").length;
-  const offline = results.length - online;
-  logger.info(
-    `Summary: ${online}/${results.length} online, ${offline} offline`,
-  );
-  return offline > 0 ? 1 : 0;
+  logger.info(`Summary: ${online}/${results.length} online`);
+  return online === results.length ? 0 : 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -793,7 +1044,7 @@ async function verifyFkOrphans(nodes) {
             nodeOrphans += cnt;
           }
         } catch {
-          /* ignore per-FK errors */
+          /* ignore */
         }
       }
       if (nodeOrphans === 0) logger.info(`  ✅ No orphans`);
@@ -878,183 +1129,16 @@ async function fixLogs(nodes) {
 /* MODE: reseed                                                       */
 /* ------------------------------------------------------------------ */
 
-async function preflight(source, targets, tables) {
-  logger.info("Pre-flight checks...");
-  try {
-    execSync("which mysqldump", { stdio: "ignore" });
-    execSync("which mysql", { stdio: "ignore" });
-  } catch {
-    throw new Error("mysqldump or mysql not found on PATH");
-  }
-
-  for (const n of [source, ...targets]) {
-    const db = buildKnexFor(parseMysqlUrl(n.url));
-    try {
-      const recent = await db("sym_change_log")
-        .where("created_at", ">", new Date(Date.now() - 60000))
-        .count("* as c")
-        .first();
-      if (Number(recent?.c || 0) > 0) {
-        throw new Error(
-          `[${n.id}] has recent log entries — sync is RUNNING. Stop pm2 first.`,
-        );
-      }
-    } catch (err) {
-      if (/RUNNING/.test(err.message)) throw err;
-    } finally {
-      await db.destroy().catch(() => {});
-    }
-  }
-
-  const srcDb = buildKnexFor(parseMysqlUrl(source.url));
-  const srcTables = await srcDb.raw(
-    `SELECT TABLE_NAME FROM information_schema.TABLES
-     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'`,
-  );
-  const srcSet = new Set((srcTables[0] || srcTables).map((r) => r.TABLE_NAME));
-  const missingOnSource = tables.filter((t) => !srcSet.has(t));
-  if (missingOnSource.length > 0) {
-    throw new Error(`Source missing tables: ${missingOnSource.join(", ")}`);
-  }
-  let totalRows = 0;
-  for (const t of tables) {
-    try {
-      const c = await srcDb(t).count("* as c").first();
-      totalRows += Number(c?.c || 0);
-    } catch {
-      /* ignore */
-    }
-  }
-  if (totalRows === 0) throw new Error("Source has 0 rows — refusing");
-  await srcDb.destroy();
-
-  for (const tgt of targets) {
-    const tgtDb = buildKnexFor(parseMysqlUrl(tgt.url));
-    const tgtTables = await tgtDb.raw(
-      `SELECT TABLE_NAME FROM information_schema.TABLES
-       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'`,
-    );
-    const tgtSet = new Set(
-      (tgtTables[0] || tgtTables).map((r) => r.TABLE_NAME),
-    );
-    const missing = tables.filter((t) => !tgtSet.has(t));
-    if (missing.length > 0) {
-      throw new Error(
-        `Target [${tgt.id}] missing tables: ${missing.join(", ")}`,
-      );
-    }
-    await tgtDb.destroy();
-  }
-  logger.info(
-    `Pre-flight OK (source ${totalRows} rows, ${tables.length} tables)`,
-  );
-}
-
-async function runDump(conn, tables, outFile) {
-  const defaultsFile = makeDefaultsFile(conn);
-  const args = [
-    `--defaults-extra-file=${defaultsFile}`,
-    "--single-transaction",
-    "--routines=false",
-    "--triggers=false",
-    conn.database,
-    ...tables,
-  ];
-  return new Promise((resolve, reject) => {
-    const out = fs.createWriteStream(outFile);
-    const p = spawnTracked("mysqldump", args, {
-      stdio: ["ignore", "pipe", "inherit"],
-    });
-    p.stdout.pipe(out);
-    p.on("close", (code) => {
-      try {
-        fs.unlinkSync(defaultsFile);
-        tempFiles.delete(defaultsFile);
-      } catch {
-        /* ignore */
-      }
-      code === 0 ? resolve() : reject(new Error(`mysqldump exit ${code}`));
-    });
-    p.on("error", reject);
-  });
-}
-
-async function pipeDump(src, tgt, tables) {
-  const srcDefaults = makeDefaultsFile(src);
-  const tgtDefaults = makeDefaultsFile(tgt);
-  const dumpArgs = [
-    `--defaults-extra-file=${srcDefaults}`,
-    "--single-transaction",
-    "--no-create-info",
-    "--routines=false",
-    "--triggers=false",
-    "--extended-insert",
-    "--complete-insert",
-    src.database,
-    ...tables,
-  ];
-  const loadArgs = [`--defaults-extra-file=${tgtDefaults}`, tgt.database];
-
-  return new Promise((resolve, reject) => {
-    const d = spawnTracked("mysqldump", dumpArgs, {
-      stdio: ["ignore", "pipe", "inherit"],
-    });
-    const l = spawnTracked("mysql", loadArgs, {
-      stdio: ["pipe", "inherit", "inherit"],
-    });
-    d.stdout.pipe(l.stdin);
-    const cleanup = () => {
-      for (const f of [srcDefaults, tgtDefaults]) {
-        try {
-          fs.unlinkSync(f);
-          tempFiles.delete(f);
-        } catch {
-          /* ignore */
-        }
-      }
-    };
-    let dc = null,
-      lc = null;
-    const tryDone = () => {
-      if (dc === null || lc === null) return;
-      cleanup();
-      if (dc !== 0) return reject(new Error(`mysqldump exit ${dc}`));
-      if (lc !== 0) return reject(new Error(`mysql exit ${lc}`));
-      resolve();
-    };
-    d.on("close", (c) => {
-      dc = c;
-      tryDone();
-    });
-    l.on("close", (c) => {
-      lc = c;
-      tryDone();
-    });
-    d.on("error", (err) => {
-      cleanup();
-      reject(err);
-    });
-    l.on("error", (err) => {
-      cleanup();
-      reject(err);
-    });
-  });
-}
-
 async function reseedOne(source, target, tables) {
   const srcConn = parseMysqlUrl(source.url);
   const tgtConn = parseMysqlUrl(target.url);
   const backupFile = uniqueBackupPath(target.id);
 
-  if (target.id === process.env.LOCAL_ID) {
-    logger.warn(`Target [${target.id}] is THIS machine`);
-  }
-
   if (opts.backup) {
     logger.info(`[1/7] Backing up [${target.id}] -> ${backupFile}`);
     try {
       await withTimeout(
-        runDump(tgtConn, tables, backupFile),
+        runDumpExcluding(tgtConn, tables, [], backupFile),
         RESEED_TIMEOUT_MS,
         "backup",
       );
@@ -1069,16 +1153,8 @@ async function reseedOne(source, target, tables) {
   if (!opts.skipTriggers) {
     logger.info(`[2/7] Dropping triggers on [${target.id}]`);
     try {
-      const db = buildKnexFor(tgtConn);
-      const r = await db.raw(
-        `SELECT TRIGGER_NAME FROM information_schema.TRIGGERS
-         WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME LIKE 'sym_trig_%'`,
-      );
-      const list = r[0] || r;
-      for (const t of list)
-        await db.raw(`DROP TRIGGER IF EXISTS \`${t.TRIGGER_NAME}\``);
-      logger.info(`[2/7] Dropped ${list.length} triggers`);
-      await db.destroy();
+      const count = await dropTriggersOnTarget(tgtConn);
+      logger.info(`[2/7] Dropped ${count} triggers`);
     } catch (err) {
       logger.error(`Trigger drop failed: ${err.message}`);
       return false;
@@ -1196,6 +1272,229 @@ async function reseed(source, targets, tables) {
 }
 
 /* ------------------------------------------------------------------ */
+/* MODE: new-branch                                                   */
+/* ------------------------------------------------------------------ */
+
+async function provisionNewBranch(source, target, newStoreMeta, tables) {
+  const srcConn = parseMysqlUrl(source.url);
+  const tgtConn = parseMysqlUrl(target.url);
+
+  // Step 0: Backup existing target (in case it's not truly fresh)
+  const targetBackup = uniqueBackupPath(`${target.id}-pre-new-branch`);
+  logger.info(`[0/7] Backing up existing [${target.id}] -> ${targetBackup}`);
+  try {
+    await runDumpExcluding(tgtConn, tables, [], targetBackup);
+    logger.info(`[0/7] Target backup written`);
+  } catch (err) {
+    logger.warn(`[0/7] Target backup failed (may be empty): ${err.message}`);
+  }
+
+  // Step 0b: Record source max change_id (BEFORE dump)
+  const srcDb = buildKnexFor(srcConn);
+  let maxChangeId = 0n;
+  try {
+    const maxRow = await srcDb("sym_change_log").max("change_id as m").first();
+    maxChangeId = BigInt(maxRow?.m || 0);
+  } catch (err) {
+    if (!/doesn't exist/i.test(err.message)) throw err;
+  }
+  await srcDb.destroy();
+  logger.info(`[0/7] Source [${source.id}] max change_id = ${maxChangeId}`);
+
+  // Step 1: Dump source (excluding sync tables)
+  const dumpFile = path.join(BACKUP_DIR, `new-branch-source-${Date.now()}.sql`);
+  logger.info(`[1/7] Dumping [${source.id}] -> ${dumpFile}`);
+  await withTimeout(
+    runDumpExcluding(
+      srcConn,
+      tables,
+      ["sym_change_log", "sym_checkpoint"],
+      dumpFile,
+    ),
+    RESEED_TIMEOUT_MS,
+    "dump",
+  );
+  const dumpSize = (fs.statSync(dumpFile).size / 1024 / 1024).toFixed(1);
+  logger.info(`[1/7] Dump written (${dumpSize} MB)`);
+
+  // Step 2: Drop triggers on target
+  logger.info(`[2/7] Dropping triggers on [${target.id}]`);
+  const droppedCount = await dropTriggersOnTarget(tgtConn);
+  logger.info(`[2/7] Dropped ${droppedCount} triggers`);
+
+  // Step 3: Truncate target tables + sync state
+  logger.info(
+    `[3/7] Truncating ${tables.length} tables + sync state on [${target.id}]`,
+  );
+  const tgtDb1 = buildKnexFor(tgtConn);
+  await tgtDb1.raw("SET FOREIGN_KEY_CHECKS = 0");
+  let truncated = 0;
+  for (const tbl of tables) {
+    try {
+      await tgtDb1.raw(`TRUNCATE TABLE \`${tbl}\``);
+      truncated++;
+    } catch (err) {
+      logger.warn(`  truncate ${tbl}: ${err.message}`);
+    }
+  }
+  for (const t of ["sym_change_log", "sym_checkpoint"]) {
+    try {
+      await tgtDb1.raw(`TRUNCATE TABLE \`${t}\``);
+    } catch (err) {
+      if (!/doesn't exist/i.test(err.message))
+        logger.warn(`  truncate ${t}: ${err.message}`);
+    }
+  }
+  await tgtDb1.raw("SET FOREIGN_KEY_CHECKS = 1");
+  await tgtDb1.destroy();
+  logger.info(`[3/7] Truncated ${truncated}/${tables.length} tables`);
+
+  // Step 3b: Restore source dump into target
+  logger.info(`[3/7] Restoring source dump into [${target.id}]`);
+  await withTimeout(
+    restoreFromFile(tgtConn, dumpFile),
+    RESEED_TIMEOUT_MS,
+    "restore",
+  );
+  logger.info(`[3/7] Restore complete`);
+
+  // Step 4: Clean inherited operational state
+  logger.info(`[4/7] Cleaning inherited operational state on [${target.id}]`);
+  const cleanDb = buildKnexFor(tgtConn);
+  const openSessions = await cleanDb("pos_session").where("status", 1).del();
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const todaysCash = await cleanDb("cash_count")
+    .where("created_at", ">=", todayStart)
+    .del();
+  logger.info(
+    `[4/7] Cleared ${openSessions} open pos_session(s), ${todaysCash} today's cash_count(s)`,
+  );
+  await cleanDb.destroy();
+
+  // Step 5: Rebuild triggers BEFORE creating target-specific data
+  // (so store/stocks/store_user inserts get logged and can sync to hub)
+  logger.info(`[5/7] Rebuilding triggers on [${target.id}]`);
+  const targetNode = {
+    id: target.id,
+    client: "mysql2",
+    db: buildKnexFor(tgtConn),
+  };
+  const trigSummary = await setupNodeTriggers(targetNode);
+  await targetNode.db.destroy();
+  logger.info(
+    `[5/7] Triggers rebuilt: ok=${trigSummary.ok.length} skipped=${trigSummary.skipped.length} failed=${trigSummary.failed.length}`,
+  );
+
+  // Step 6: Create target-specific data (store, stocks, store_user)
+  logger.info(`[6/7] Creating target-specific data for [${target.id}]`);
+  const setupDb = buildKnexFor(tgtConn);
+  const newStoreUuid = newStoreMeta.storeUuid || crypto.randomUUID();
+
+  // Check if store name already exists
+  const existing = await setupDb("store")
+    .where("name", newStoreMeta.name)
+    .first();
+  if (existing) {
+    await setupDb.destroy();
+    throw new Error(
+      `Store "${newStoreMeta.name}" already exists on [${target.id}] with record_id=${existing.record_id}`,
+    );
+  }
+
+  await setupDb("store").insert({
+    record_id: newStoreUuid,
+    name: newStoreMeta.name,
+    address: newStoreMeta.address || "",
+    contact_no: newStoreMeta.contactNo || "",
+    contact_person: newStoreMeta.contactPerson || "",
+    other_info: newStoreMeta.otherInfo || "",
+    type: 0,
+    setup: null,
+    status: 1,
+    created_at: new Date(),
+    updated_at: new Date(),
+  });
+  logger.info(`[6/7] Store "${newStoreMeta.name}" created (${newStoreUuid})`);
+
+  const products = await setupDb("product")
+    .select("record_id")
+    .where("status", 1);
+  let stockCount = 0;
+  for (let i = 0; i < products.length; i += 100) {
+    const chunk = products.slice(i, i + 100);
+    const rows = chunk.map((p) => ({
+      record_id: crypto.randomUUID(),
+      product: p.record_id,
+      store: newStoreUuid,
+      qty: 0,
+      status: 1,
+      last_updated: null,
+      created_at: new Date(),
+      updated_at: new Date(),
+    }));
+    await setupDb("stocks_on_hand").insert(rows);
+    stockCount += rows.length;
+  }
+  logger.info(
+    `[6/7] Created ${stockCount} zero-stock rows for ${products.length} product(s)`,
+  );
+
+  if (newStoreMeta.userIds && newStoreMeta.userIds.length > 0) {
+    let userCount = 0;
+    for (const userId of newStoreMeta.userIds) {
+      const exists = await setupDb("store_user")
+        .where({ user: userId, store: newStoreUuid })
+        .first();
+      if (exists) {
+        logger.debug(`  user ${userId} already assigned — skip`);
+        continue;
+      }
+      await setupDb("store_user").insert({
+        record_id: crypto.randomUUID(),
+        user: userId,
+        store: newStoreUuid,
+        is_primary: userId === newStoreMeta.primaryUserId ? 1 : 0,
+        created_at: new Date(),
+        updated_at: new Date(),
+      });
+      userCount++;
+    }
+    logger.info(`[6/7] Assigned ${userCount} user(s) to store`);
+  } else {
+    logger.warn(`[6/7] No users specified — store has no user assignments`);
+  }
+
+  // Step 7: Set checkpoint so hub doesn't replay history
+  const buffer = 10000n;
+  const startCheckpoint = maxChangeId > buffer ? maxChangeId - buffer : 0n;
+  logger.info(
+    `[7/7] Setting checkpoint for [${source.id}] to ${startCheckpoint} (${buffer} buffer)`,
+  );
+  await setupDb("sym_checkpoint").insert({
+    node_id: source.id,
+    last_processed_change_id: startCheckpoint.toString(),
+    updated_at: new Date(),
+  });
+  await setupDb.destroy();
+
+  logger.info(`\n✅ [${target.id}] provisioned successfully`);
+  logger.info(`   Store:      ${newStoreMeta.name} (${newStoreUuid})`);
+  logger.info(`   Products:   ${products.length}`);
+  logger.info(`   Stocks:     ${stockCount} zero-qty rows`);
+  logger.info(`   Users:      ${newStoreMeta.userIds?.length || 0}`);
+  logger.info(
+    `   Checkpoint: ${startCheckpoint} → will sync forward from here`,
+  );
+  logger.info(`\n   Next: pm2 start all (on all nodes including new branch)`);
+  logger.info(
+    `   The store/stocks/store_user rows are in target's log and will sync to hub.`,
+  );
+
+  return true;
+}
+
+/* ------------------------------------------------------------------ */
 /* MODE: reconcile                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -1297,21 +1596,11 @@ async function reconcile(nodes, tables) {
 
   const otherBranches = nodes.filter((n) => n.id !== source.id);
 
-  // Dry-run report
   if (!opts.apply) {
-    logger.info(`\n[DRY RUN] Would:`);
+    logger.info(`\n[DRY RUN] Would reseed all branches from [${source.id}].`);
     if (opts.enrichTables && opts.enrichTables.length > 0) {
-      logger.info(
-        `  1. Enrich [${source.id}] from these tables in other nodes:`,
-      );
-      logger.info(`     ${opts.enrichTables.join(", ")}`);
-    } else {
-      logger.info(
-        `  1. (Skip enrichment — use --enrich-tables=t1,t2 to enable)`,
-      );
+      logger.info(`Enrich tables: ${opts.enrichTables.join(", ")}`);
     }
-    logger.info(`  2. Reseed all branches from [${source.id}]`);
-    logger.info(`\nRun with --apply to execute.`);
     return 0;
   }
 
@@ -1322,14 +1611,12 @@ async function reconcile(nodes, tables) {
     return 2;
   }
 
-  // Enrichment: pull unique rows from specific tables only
   if (opts.enrichTables && opts.enrichTables.length > 0) {
     logger.info(
       `\n[Enrich] Pulling unique rows for: ${opts.enrichTables.join(", ")}`,
     );
     const srcConn = parseMysqlUrl(source.url);
     const srcNode = buildNode(srcConn, source.id);
-    // Pull unique rows from each other branch, insert into source
     for (const branch of otherBranches) {
       const brConn = parseMysqlUrl(branch.url);
       const brNode = buildNode(brConn, branch.id);
@@ -1352,13 +1639,12 @@ async function reconcile(nodes, tables) {
                   .ignore();
                 inserted += Math.min(100, unique.length - i);
               } catch {
-                /* per-row fallback */
                 for (const row of unique.slice(i, i + 100)) {
                   try {
                     await srcNode.db(t).insert(row).onConflict(pk).ignore();
                     inserted++;
                   } catch {
-                    /* skip — orphan */
+                    /* skip */
                   }
                 }
               }
@@ -1374,7 +1660,6 @@ async function reconcile(nodes, tables) {
     await srcNode.db.destroy();
   }
 
-  // Reseed
   logger.info(
     `\n[Reseed] ${source.id} -> ${otherBranches.map((b) => b.id).join(", ")}`,
   );
@@ -1420,13 +1705,22 @@ async function main() {
     return await reconcile(nodes, resolveTables());
   }
 
-  // reseed
+  // --new-branch or --reseed
   const tables = resolveTables();
+
+  // Resolve source (defaults to hub for new-branch)
   let source;
   if (opts.from) {
     source = nodes.find((n) => n.id === opts.from);
     if (!source) {
       logger.error(`Source "${opts.from}" not found`);
+      process.exit(2);
+    }
+  } else if (opts.mode === "new-branch") {
+    // Default source for new-branch is hub
+    source = nodes.find((n) => n.isHub);
+    if (!source) {
+      logger.error("No hub found and --from not specified");
       process.exit(2);
     }
   } else if (opts.to === "all") {
@@ -1437,8 +1731,22 @@ async function main() {
     process.exit(2);
   }
 
+  // Resolve target(s)
   let targets;
-  if (opts.to === "all") {
+  if (opts.mode === "new-branch") {
+    const single = nodes.find((n) => n.id === opts.to);
+    if (!single) {
+      logger.error(
+        `Target "${opts.to}" not found. Add it to BRANCHES_JSON first.`,
+      );
+      process.exit(2);
+    }
+    if (single.id === source.id) {
+      logger.error("Source and target must be different");
+      process.exit(2);
+    }
+    targets = [single];
+  } else if (opts.to === "all") {
     targets = nodes.filter((n) => n.id !== source.id);
   } else {
     const single = nodes.find((n) => n.id === opts.to);
@@ -1456,6 +1764,84 @@ async function main() {
 
   cleanupOldBackups();
 
+  // === new-branch mode ===
+  if (opts.mode === "new-branch") {
+    const newStoreMeta = {
+      name: opts.storeName,
+      address: opts.storeAddress,
+      contactNo: opts.storeContact,
+      contactPerson: opts.storeContactPerson,
+      otherInfo: opts.storeOtherInfo,
+      storeUuid: opts.storeUuid,
+      userIds: opts.storeUsers,
+      primaryUserId: opts.primaryUser,
+    };
+
+    if (!opts.apply) {
+      logger.info(
+        `\n[DRY RUN] Would provision new branch [${opts.to}] from [${source.id}]`,
+      );
+      logger.info(`   Store:      ${newStoreMeta.name}`);
+      logger.info(`   Address:    ${newStoreMeta.address || "(empty)"}`);
+      logger.info(`   Contact:    ${newStoreMeta.contactNo || "(empty)"}`);
+      logger.info(
+        `   Contact person: ${newStoreMeta.contactPerson || "(empty)"}`,
+      );
+      logger.info(
+        `   Users:      ${newStoreMeta.userIds?.join(", ") || "(none)"}`,
+      );
+      logger.info(`   Primary:    ${newStoreMeta.primaryUserId || "(none)"}`);
+      logger.info(`\n   Steps:`);
+      logger.info(`     1. Backup existing target`);
+      logger.info(
+        `     2. Dump [${source.id}] excluding sym_change_log/sym_checkpoint`,
+      );
+      logger.info(`     3. Drop triggers on [${opts.to}]`);
+      logger.info(`     4. Truncate all tables on [${opts.to}]`);
+      logger.info(`     5. Restore source dump into [${opts.to}]`);
+      logger.info(`     6. Clear inherited pos_session/cash_count`);
+      logger.info(`     7. Rebuild triggers on [${opts.to}]`);
+      logger.info(
+        `     8. Create new store + zero stocks + store_user assignments`,
+      );
+      logger.info(`     9. Set checkpoint so hub doesn't replay history`);
+      logger.info(`\n   Run with --apply to execute.`);
+      return 0;
+    }
+
+    if (
+      !(await confirmApply(
+        [opts.to],
+        `Source: [${source.id}], Store: "${newStoreMeta.name}"`,
+      ))
+    ) {
+      logger.warn("Aborted.");
+      return 2;
+    }
+
+    if (!opts.skipPreflight) {
+      try {
+        await preflight(source, targets, tables);
+      } catch (err) {
+        logger.error(`Pre-flight FAILED: ${err.message}`);
+        return 2;
+      }
+    }
+
+    logger.warn("Starting in 10 seconds. Ctrl+C to abort...");
+    await new Promise((r) => setTimeout(r, 10000));
+
+    try {
+      await provisionNewBranch(source, targets[0], newStoreMeta, tables);
+      return 0;
+    } catch (err) {
+      logger.error(`New-branch provisioning failed: ${err.message}`);
+      logger.error(`Stack: ${err.stack}`);
+      return 1;
+    }
+  }
+
+  // === reseed mode (existing) ===
   if (!opts.apply) {
     logger.info(`\nSource: ${source.id}`);
     logger.info(`Targets: ${targets.map((t) => t.id).join(", ")}`);
