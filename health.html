@@ -1,0 +1,101 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Replica Health</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 2em; background: #1e1e1e; color: #ddd; max-width: 1000px; margin: 0 auto; }
+    h1 { margin-top: 0; }
+    input, button { padding: 0.5em; font-size: 1em; font-family: monospace; }
+    input { width: 500px; background: #2d2d2d; color: #fff; border: 1px solid #444; }
+    button { background: #4caf50; color: #fff; border: none; cursor: pointer; }
+    button:hover { background: #45a049; }
+    pre { background: #2d2d2d; padding: 1em; border-radius: 4px; white-space: pre-wrap; word-break: break-all; }
+    .ok { color: #4caf50; font-weight: bold; }
+    .bad { color: #f44336; font-weight: bold; }
+    .branch { margin: 0.3em 0; }
+    .row { margin: 0.5em 0; }
+  </style>
+</head>
+<body>
+  <h1>Replica Health Check</h1>
+
+  <div class="row">
+    <label>URL: <input id="url" value="http://localhost:8182/health"></label>
+  </div>
+  <div class="row">
+    <label>API Key: <input id="key" type="password" placeholder="paste API_SECRET_KEY from .env"></label>
+    <button onclick="fetchHealth()">Fetch</button>
+  </div>
+
+  <pre id="out">Click Fetch to load.</pre>
+
+  <script>
+    // Auto-fill the key from localStorage so you only paste it once
+    const keyInput = document.getElementById('key');
+    const saved = localStorage.getItem('replica_api_key');
+    if (saved) keyInput.value = saved;
+
+    async function fetchHealth() {
+      const url = document.getElementById('url').value.trim();
+      const key = keyInput.value.trim();
+      const out = document.getElementById('out');
+      localStorage.setItem('replica_api_key', key);
+      out.textContent = 'Fetching...';
+
+      try {
+        const res = await fetch(url, { headers: { 'x-api-key': key } });
+        const text = await res.text();
+        let obj;
+        try { obj = JSON.parse(text); } catch { obj = null; }
+
+        if (!obj) {
+          out.textContent = `HTTP ${res.status}\n${text}`;
+          return;
+        }
+
+        if (obj.error) {
+          out.innerHTML = `<span class="bad">HTTP ${res.status}: ${obj.error}</span>`;
+          return;
+        }
+
+        // Rendered summary
+        const head = obj.healthy
+          ? `<span class="ok">✅ HEALTHY</span>`
+          : `<span class="bad">❌ UNHEALTHY</span>`;
+
+        const branches = (obj.branches || []).map(b =>
+          `  <div class="branch">${b.branchId}: ${b.healthy ? '✅' : '❌'}  ` +
+          `consecutiveErrors=${b.consecutiveErrors ?? '?'}  ` +
+          `status=${b.status || '?'}` +
+          (b.lastError ? `  <br>&nbsp;&nbsp;lastError: <code>${escapeHtml(b.lastError)}</code>` : '') +
+          `</div>`
+        ).join('');
+
+        out.innerHTML =
+          `<div>Hub: <b>${obj.hub}</b></div>` +
+          `<div>Overall: ${head}</div>` +
+          `<div>Any halted: ${obj.anyHalted}</div>` +
+          `<div>Deferred rows: ${obj.totalDeferredRows}</div>` +
+          `<hr>` +
+          `<div>Branches (${(obj.branches || []).length}):</div>` +
+          branches +
+          `<hr><details><summary>Raw JSON</summary><pre>${escapeHtml(JSON.stringify(obj, null, 2))}</pre></details>`;
+      } catch (err) {
+        out.innerHTML = `<span class="bad">Fetch error: ${escapeHtml(err.message)}</span>\n\n` +
+          `Possible causes:\n` +
+          `- CORS: open this file from the same origin as the API (serve it from the hub), or add CORS to /health\n` +
+          `- Wrong URL (check the port; default is 8182)\n` +
+          `- Server not running (pm2 status replica-engine)`;
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    // Allow pressing Enter in the key field
+    keyInput.addEventListener('keydown', e => { if (e.key === 'Enter') fetchHealth(); });
+  </script>
+</body>
+</html>

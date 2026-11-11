@@ -1,0 +1,15 @@
+
+> start
+> node server.js
+
+◇ injected env (13) from .env // tip: ◈ secrets for agents [www.dotenvx.com]
+◇ injected env (0) from .env // tip: ⌘ custom filepath { path: '/custom/path/.env' }
+[2026-09-02T04:00:43.527Z] [INFO]: Starting Hub-and-Spoke Engine for Hub [NODE_MAIN_HUB]...
+[Triggers] Installing triggers on node [NODE_MAIN_HUB] (mysql2) for 65 table(s)...
+[Triggers] Installing triggers on node [NODE_BRANCH_01] (mysql2) for 65 table(s)...
+[2026-09-02T04:01:29.360Z] [INFO]: [Startup] Provisioned schema and settings for branch: [NODE_BRANCH_01]
+[2026-09-02T04:01:29.360Z] [INFO]: Registered sync worker for branch: [NODE_BRANCH_01]
+[2026-09-02T04:01:29.360Z] [INFO]: [Startup Sync] Checking and draining pending backlog across all nodes...
+[2026-09-02T04:01:29.444Z] [INFO]: [Startup Sync] Flush complete. Flushed 0 batches of pending changes. All nodes caught up!
+[2026-09-02T04:01:29.447Z] [INFO]: All 1 branch sync loops launched independently.
+[2026-09-02T04:01:29.448Z] [INFO]: Hub Monitoring API active on port 8182
