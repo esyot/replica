@@ -145,7 +145,9 @@ function buildKnexConnection(nodeClient, opts) {
       ssl: opts.ssl ? { rejectUnauthorized: opts.sslStrict !== false } : false,
     };
   }
-  return parseConnectionString(opts.url, defaultPortFor(nodeClient));
+  const conn = parseConnectionString(opts.url, defaultPortFor(nodeClient));
+  if (opts.ssl) conn.ssl = { rejectUnauthorized: opts.sslStrict !== false };
+  return conn;
 }
 
 /* ------------------------------------------------------------------ */
@@ -209,7 +211,7 @@ const branchNodes = BRANCHES_CONFIG.map((b) => {
       client: clientName,
       connection: buildKnexConnection(clientName, {
         url: b.url,
-        ssl: true,
+        ssl: b.ssl === true,
         sslStrict: b.sslInsecure !== true,
       }),
       pool: {
@@ -250,17 +252,18 @@ const CONFIG = {
   flushMaxIterations: parseIntEnv("FLUSH_MAX_ITERATIONS", 100000, { min: 1 }),
   shutdownTimeoutMs: parseIntEnv("SHUTDOWN_TIMEOUT_MS", 10000, { min: 2000 }),
 
-  // Defer-retry for transient FK failures (cross-batch dependencies)
   deferMaxAttempts: parseIntEnv("DEFER_MAX_ATTEMPTS", 5, { min: 1, max: 100 }),
   deferMaxQueueSize: parseIntEnv("DEFER_MAX_QUEUE_SIZE", 10000, { min: 1 }),
 
-  // Dependency-order cache TTL
   dependencyOrderTtlMs: parseIntEnv("DEPENDENCY_ORDER_TTL_MS", 60000, {
     min: 1000,
   }),
 
-  // Health endpoint caching for row-count estimates
   healthCacheTtlMs: parseIntEnv("HEALTH_CACHE_TTL_MS", 30000, { min: 1000 }),
+
+  // NEW: when true, the hub re-emits applied changes into its own
+  // sym_change_log so that downstream branches can receive them.
+  relayEnabled: parseBoolEnv("RELAY_ENABLED", true),
 };
 
 if (CONFIG.encryptionKey) {
@@ -531,13 +534,19 @@ function clearDependencyOrderCache(nodeId) {
 /* ------------------------------------------------------------------ */
 
 class SyncWorker {
-  constructor(source, target) {
+  constructor(source, target, opts = {}) {
     this.source = source;
     this.target = target;
     this.isProcessing = false;
     this.checkpointCallCount = 0;
 
-    this.deferred = []; // [{ table, change, attempts }]
+    // NEW: if this worker is running on the hub, and relay is enabled,
+    // it will re-emit applied changes into the hub's own sym_change_log
+    // so that downstream branch workers can pick them up.
+    this.isHub = target.id === HUB_NODE.id;
+    this.relayEnabled = this.isHub && CONFIG.relayEnabled && !opts.disableRelay;
+
+    this.deferred = [];
 
     this.halted = false;
     this.haltReason = null;
@@ -546,6 +555,7 @@ class SyncWorker {
     this.stats = {
       appliedEvents: 0,
       skippedEvents: 0,
+      relayedEvents: 0,
       quarantinedEvents: 0,
       deferredEvents: 0,
       resolvedDeferred: 0,
@@ -722,6 +732,55 @@ class SyncWorker {
     }
   }
 
+  /**
+   * NEW: Re-emit applied changes into the target's own sym_change_log
+   * so downstream workers can relay them. Only the hub does this (branches
+   * are leaves — they don't need to relay to anyone else).
+   *
+   * We insert rows OUTSIDE the @sym_is_syncing bypass, so the trigger fires
+   * and re-logs them, but we pass `node_source_id = hub.id` so downstream
+   * workers can distinguish hub-originated events from relayed ones.
+   *
+   * Note: we set @sym_is_syncing = NULL just for the insert so the trigger
+   * fires and captures the change. But we must NOT let this re-insert get
+   * re-read by the worker that just applied it — that's guarded by the
+   * `whereNot("node_source_id", target.id)` filter in processBatch, since
+   * the worker on the hub for branchA filters out hub-sourced events
+   * (which is what the relay rows are). And the branchA→hub worker's
+   * target is the hub, so `whereNot("node_source_id", hub.id)` skips them.
+   * Effectively: hub-originated rows are invisible to hub's own incoming
+   * workers, which is exactly what we want.
+   */
+  async relayChanges(trx, tableName, tableChanges) {
+    if (!this.relayEnabled || tableChanges.length === 0) return 0;
+
+    const rows = tableChanges.map((change) => ({
+      table_name: change.table_name,
+      operation: change.operation,
+      primary_key_val: change.primary_key_val,
+      row_data: change.row_data,
+      node_source_id: this.target.id,
+    }));
+
+    let inserted = 0;
+    const chunkSize = CONFIG.upsertChunkSize;
+    for (let i = 0; i < rows.length; i += chunkSize) {
+      const chunk = rows.slice(i, i + chunkSize);
+      try {
+        // Direct insert, bypassing the trigger. The trigger itself is
+        // suppressed because @sym_is_syncing is still TRUE at this point,
+        // but we WANT the row in the log — so we insert it directly.
+        await trx("sym_change_log").insert(chunk);
+        inserted += chunk.length;
+      } catch (err) {
+        logger.warn(
+          `[Relay] Failed to re-emit ${chunk.length} events for ${tableName}: ${err.message}`,
+        );
+      }
+    }
+    return inserted;
+  }
+
   isDeferrableFkError(err) {
     const msg = String(err?.message || err || "");
     return (
@@ -764,7 +823,6 @@ class SyncWorker {
       } catch (err) {
         d.attempts++;
         if (d.attempts >= CONFIG.deferMaxAttempts) {
-          // HALT — don't quarantine
           this.halted = true;
           this.haltReason = `change_id=${d.change.change_id} table=${d.table} failed ${d.attempts} attempts: ${err.message}`;
           this.haltedAt = new Date();
@@ -848,7 +906,6 @@ class SyncWorker {
         return changes.length === CONFIG.batchSize;
       }
 
-      // Derive dynamic FK-safe order for batch + deferred
       const allTables = new Set([
         ...byTable.keys(),
         ...this.deferred.map((d) => d.table),
@@ -868,6 +925,7 @@ class SyncWorker {
       let appliedCount = 0;
       let deferredAdded = 0;
       let deferredResolved = 0;
+      let relayedCount = 0;
 
       try {
         await this.target.db.transaction(async (trx) => {
@@ -875,21 +933,21 @@ class SyncWorker {
           try {
             restoreSession = await this.setSessionBypass(trx);
 
-            // Phase A: retry deferred
             if (this.deferred.length > 0) {
               const r = await this.retryDeferred(trx);
               deferredResolved = r.resolved;
               this.deferred = r.stillDeferred;
             }
 
-            // Phase B: apply new work in FK-safe order
             for (const tableName of tableOrder) {
               const tableChanges = byTable.get(tableName);
               if (!tableChanges || tableChanges.length === 0) continue;
 
+              const successfullyApplied = [];
               try {
                 await this.applyTableChanges(trx, tableName, tableChanges);
                 appliedCount += tableChanges.length;
+                successfullyApplied.push(...tableChanges);
               } catch (tableErr) {
                 logger.error(
                   `[Sync Engine] Table apply failed for ${tableName}: ${tableErr.message}. Per-row fallback.`,
@@ -898,6 +956,7 @@ class SyncWorker {
                   try {
                     await this.applyTableChanges(trx, tableName, [change]);
                     appliedCount++;
+                    successfullyApplied.push(change);
                   } catch (rowErr) {
                     if (this.isDeferrableFkError(rowErr)) {
                       if (this.deferred.length >= CONFIG.deferMaxQueueSize) {
@@ -919,7 +978,6 @@ class SyncWorker {
                         `[Deferred] change_id=${change.change_id} table=${tableName} — FK not satisfied, will retry (queue=${this.deferred.length})`,
                       );
                     } else {
-                      // Non-FK error: halt
                       this.halted = true;
                       this.haltReason = `change_id=${change.change_id} table=${tableName}: ${rowErr.message}`;
                       this.haltedAt = new Date();
@@ -931,9 +989,18 @@ class SyncWorker {
                   }
                 }
               }
+
+              // Relay successfully-applied changes into the hub's log
+              if (successfullyApplied.length > 0 && this.relayEnabled) {
+                const relayed = await this.relayChanges(
+                  trx,
+                  tableName,
+                  successfullyApplied,
+                );
+                relayedCount += relayed;
+              }
             }
 
-            // Checkpoint: do NOT advance past earliest deferred row
             const deferredIds = this.deferred
               .map((d) => BigInt(d.change.change_id))
               .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
@@ -956,6 +1023,7 @@ class SyncWorker {
       }
 
       this.stats.appliedEvents += appliedCount;
+      this.stats.relayedEvents += relayedCount;
       this.stats.deferredEvents += deferredAdded;
       this.stats.resolvedDeferred += deferredResolved;
       this.stats.batches++;
@@ -963,7 +1031,9 @@ class SyncWorker {
 
       logger.info(
         `[Sync Engine] ${this.source.id} -> ${this.target.id} | Applied ${appliedCount}, ` +
-          `skipped ${skippedEventCount}, deferred +${deferredAdded}/-${deferredResolved} (queue=${this.deferred.length})`,
+          `relayed ${relayedCount}, ` +
+          `skipped ${skippedEventCount}, ` +
+          `deferred +${deferredAdded}/-${deferredResolved} (queue=${this.deferred.length})`,
       );
 
       return (
@@ -1168,7 +1238,6 @@ function requireApiKey(req, res, next) {
 let syncManagers = [];
 let managerById = new Map();
 
-// Row-count cache for /health (approximate)
 let rowCountCache = { ts: 0, hub: null, branches: new Map() };
 
 async function approximateRowCount(node) {
@@ -1231,10 +1300,6 @@ app.get("/health", requireApiKey, async (req, res) => {
             ? (hubMaxChangeId - lastProcessed).toString()
             : null;
 
-        const hubToBranchLag =
-          hubMaxChangeId != null ? hubMaxChangeId - lastProcessed : null;
-        const branchToHubLag = null; // could compute similar way
-
         const isHalted = h2b?.halted || b2h?.halted;
 
         return {
@@ -1294,6 +1359,7 @@ app.get("/health", requireApiKey, async (req, res) => {
     anyHalted,
     activeBranches: branchStatus.length,
     totalDeferredRows: totalDeferred,
+    relayEnabled: CONFIG.relayEnabled,
     branches: branchStatus,
   });
 });
@@ -1328,7 +1394,8 @@ async function startMultiBranchEngine() {
       `[Config] port=${CONFIG.port} pollIntervalMs=${CONFIG.pollIntervalMs} ` +
         `batchSize=${CONFIG.batchSize} branches=${branchNodes.length} ` +
         `encryptionEnabled=${Boolean(CONFIG.encryptionKey)} ` +
-        `deferMaxAttempts=${CONFIG.deferMaxAttempts}`,
+        `deferMaxAttempts=${CONFIG.deferMaxAttempts} ` +
+        `relayEnabled=${CONFIG.relayEnabled}`,
     );
 
     await provisionNode(HUB_NODE);
@@ -1346,7 +1413,10 @@ async function startMultiBranchEngine() {
       }
 
       const hubToBranch = new SyncWorker(HUB_NODE, branch);
+
+      // Branch→hub worker does NOT relay (branch is not a hub)
       const branchToHub = new SyncWorker(branch, HUB_NODE);
+
       flushList.push({ branchId: branch.id, hubToBranch, branchToHub });
 
       const manager = new BranchSyncManager(

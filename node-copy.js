@@ -1024,13 +1024,18 @@ async function verifyFkOrphans(nodes) {
       for (const fk of fks[0] || fks) {
         try {
           const res = await db.raw(
-            `SELECT COUNT(*) AS cnt FROM ?? c
-             LEFT JOIN ?? p ON p.?? = c.??
-             WHERE c.?? IS NOT NULL AND p.?? IS NULL`,
+            `SELECT COUNT(*) as cnt FROM ?? c
+   LEFT JOIN ?? p ON p.?? = c.??
+   WHERE c.?? IS NOT NULL
+     AND c.?? != ''
+     AND c.?? != '0'
+     AND p.?? IS NULL`,
             [
               fk.TABLE_NAME,
               fk.REFERENCED_TABLE_NAME,
               fk.REFERENCED_COLUMN_NAME,
+              fk.COLUMN_NAME,
+              fk.COLUMN_NAME,
               fk.COLUMN_NAME,
               fk.COLUMN_NAME,
               fk.REFERENCED_COLUMN_NAME,
@@ -1522,12 +1527,17 @@ async function scoreNode(node, tables) {
       try {
         const res = await db.raw(
           `SELECT COUNT(*) as cnt FROM ?? c
-           LEFT JOIN ?? p ON p.?? = c.??
-           WHERE c.?? IS NOT NULL AND p.?? IS NULL`,
+   LEFT JOIN ?? p ON p.?? = c.??
+   WHERE c.?? IS NOT NULL
+     AND c.?? != ''
+     AND c.?? != '0'
+     AND p.?? IS NULL`,
           [
             fk.TABLE_NAME,
             fk.REFERENCED_TABLE_NAME,
             fk.REFERENCED_COLUMN_NAME,
+            fk.COLUMN_NAME,
+            fk.COLUMN_NAME,
             fk.COLUMN_NAME,
             fk.COLUMN_NAME,
             fk.REFERENCED_COLUMN_NAME,
