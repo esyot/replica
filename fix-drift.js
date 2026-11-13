@@ -1,23 +1,4 @@
 #!/usr/bin/env node
-/**
- * fix-drift.js — dynamic reconciler for the replica sync fabric.
- *
- * Detects and (with --apply) fixes row-set drift between hub and branches.
- * Insert-only. Never deletes. Unique-index collisions are reported, never
- * silently dropped. Content diffs are reported, never auto-applied unless
- * --apply-content and a per-table authority policy are both set.
- *
- * Usage:
- *   node fix-drift.js                          # dry-run, prints plan
- *   node fix-drift.js --apply                  # apply row-set inserts
- *   node fix-drift.js --apply --collision=null # null colliding codes instead of prefix
- *   node fix-drift.js --apply --collision=skip # leave colliding rows alone
- *   node fix-drift.js --apply-content --content-authority=deposit:NODE_BRANCH_02
- *   node fix-drift.js --verbose                # full collision lists
- *   node fix-drift.js --tables=customer,repa_deposit  # limit scope
- *
- * Exit codes: 0 = parity reached, 1 = dry-run (plan printed), 2 = error, 3 = still drifted after apply.
- */
 "use strict";
 
 const fs = require("fs");
@@ -25,9 +6,8 @@ const path = require("path");
 const { execSync } = require("child_process");
 const mysql = require("mysql2/promise");
 
-// ---------------------------------------------------------------- env / CLI
+// ---------------------------------------------------------------- env
 
-// Minimal .env parser — matches the single-line discipline the project relies on.
 function loadEnv(file) {
   const txt = fs.readFileSync(file, "utf8");
   const env = {};
@@ -39,9 +19,8 @@ function loadEnv(file) {
     if (
       (v.startsWith('"') && v.endsWith('"')) ||
       (v.startsWith("'") && v.endsWith("'"))
-    ) {
+    )
       v = v.slice(1, -1);
-    }
     env[m[1]] = v;
   }
   return env;
@@ -70,21 +49,14 @@ const HUB_CONN = {
     database: ENV.HUB_DB || "candg_pos_db",
   },
 };
-
 const BRANCH_CONNS = JSON.parse(ENV.BRANCHES_JSON || "[]").map((b) => ({
   id: b.id,
   cfg: parseConnUrl(b.url),
 }));
-
 const NODES = { [HUB_CONN.id]: HUB_CONN.cfg };
 for (const b of BRANCH_CONNS) NODES[b.id] = b.cfg;
 
 // ---------------------------------------------------------------- table plan
-//
-// Each entry declares the insert direction(s) per table, in execution order.
-// `uniquePrecheck` lists non-PK unique columns that must be collision-checked
-// before insert. Adding a table here is the ONLY way it gets reconciled; the
-// script refuses to infer direction.
 
 const TABLE_PLAN = {
   customer: {
@@ -94,7 +66,10 @@ const TABLE_PLAN = {
       ["NODE_MAIN_HUB", "NODE_BRANCH_03"],
     ],
     uniquePrecheck: ["code"],
+    identityCols: ["name"],
+    contentDiffIgnoreCols: ["address"],
     contentAuthority: null,
+    safeToAutoApply: false, // blocked on BR02 corruption root-cause
   },
   repa_deposit: {
     insert: [
@@ -102,7 +77,10 @@ const TABLE_PLAN = {
       ["NODE_MAIN_HUB", "NODE_BRANCH_03"],
     ],
     uniquePrecheck: [],
+    identityCols: [],
+    contentDiffIgnoreCols: [],
     contentAuthority: null,
+    safeToAutoApply: true,
   },
   repa_member: {
     insert: [
@@ -111,7 +89,10 @@ const TABLE_PLAN = {
       ["NODE_MAIN_HUB", "NODE_BRANCH_03"],
     ],
     uniquePrecheck: [],
+    identityCols: [],
+    contentDiffIgnoreCols: [],
     contentAuthority: null,
+    safeToAutoApply: true,
   },
   repa_member_winner: {
     insert: [
@@ -119,7 +100,10 @@ const TABLE_PLAN = {
       ["NODE_MAIN_HUB", "NODE_BRANCH_03"],
     ],
     uniquePrecheck: [],
+    identityCols: [],
+    contentDiffIgnoreCols: [],
     contentAuthority: null,
+    safeToAutoApply: true,
   },
   sales_order: {
     insert: [
@@ -127,7 +111,10 @@ const TABLE_PLAN = {
       ["NODE_MAIN_HUB", "NODE_BRANCH_03"],
     ],
     uniquePrecheck: [],
+    identityCols: ["customer"],
+    contentDiffIgnoreCols: ["customer", "date_ordered"],
     contentAuthority: null,
+    safeToAutoApply: false, // blocked on BR02 corruption root-cause
   },
   sales_order_details: {
     insert: [
@@ -135,7 +122,10 @@ const TABLE_PLAN = {
       ["NODE_MAIN_HUB", "NODE_BRANCH_03"],
     ],
     uniquePrecheck: [],
+    identityCols: [],
+    contentDiffIgnoreCols: [],
     contentAuthority: null,
+    safeToAutoApply: false, // FK on sales_order
   },
   sales_payment: {
     insert: [
@@ -143,45 +133,76 @@ const TABLE_PLAN = {
       ["NODE_MAIN_HUB", "NODE_BRANCH_03"],
     ],
     uniquePrecheck: [],
+    identityCols: [],
+    contentDiffIgnoreCols: [],
     contentAuthority: null,
+    safeToAutoApply: false, // FK on sales_order
   },
-  deposit: { insert: [], uniquePrecheck: [], contentAuthority: null },
-  discount: { insert: [], uniquePrecheck: [], contentAuthority: null },
-  stock_requests: { insert: [], uniquePrecheck: [], contentAuthority: null },
+  deposit: {
+    insert: [],
+    uniquePrecheck: [],
+    identityCols: [],
+    contentDiffIgnoreCols: [],
+    contentAuthority: null,
+    safeToAutoApply: true,
+  },
+  discount: {
+    insert: [],
+    uniquePrecheck: [],
+    identityCols: [],
+    contentDiffIgnoreCols: [],
+    contentAuthority: null,
+    safeToAutoApply: true,
+  },
+  stock_requests: {
+    insert: [],
+    uniquePrecheck: [],
+    identityCols: [],
+    contentDiffIgnoreCols: [],
+    contentAuthority: null,
+    safeToAutoApply: true,
+  },
   stock_request_items: {
     insert: [],
     uniquePrecheck: [],
+    identityCols: [],
+    contentDiffIgnoreCols: [],
     contentAuthority: null,
+    safeToAutoApply: true,
   },
 };
 
-// ---------------------------------------------------------------- CLI args
+// ---------------------------------------------------------------- CLI
 
 function parseArgs(argv) {
   const a = {
     apply: false,
     applyContent: false,
-    collision: "prefix", // prefix | null | skip  — default per latest instruction
-    contentAuthority: {}, // table -> nodeId
+    onlySafe: false,
+    collision: "prefix",
+    contentAuthority: {},
     verbose: false,
     tables: null,
     batchSize: 500,
+    forceBulk: false,
   };
   for (const arg of argv.slice(2)) {
     if (arg === "--apply") a.apply = true;
     else if (arg === "--apply-content") a.applyContent = true;
+    else if (arg === "--only-safe") a.onlySafe = true;
     else if (arg === "--verbose") a.verbose = true;
+    else if (arg === "--force-bulk") a.forceBulk = true;
     else if (arg.startsWith("--collision=")) a.collision = arg.split("=")[1];
     else if (arg.startsWith("--content-authority=")) {
       const [t, n] = arg.split("=")[1].split(":");
       a.contentAuthority[t] = n;
-    } else if (arg.startsWith("--tables=")) {
+    } else if (arg.startsWith("--tables="))
       a.tables = arg.split("=")[1].split(",").filter(Boolean);
-    } else if (arg.startsWith("--batch-size=")) {
+    else if (arg.startsWith("--batch-size="))
       a.batchSize = parseInt(arg.split("=")[1], 10);
-    } else if (arg === "--help" || arg === "-h") {
+    else if (arg === "--help" || arg === "-h") {
       console.log(
-        fs.readFileSync(__filename, "utf8").split("\n").slice(2, 22).join("\n"),
+        fs.readFileSync(__filename, "utf8").split("\n").slice(2, 30).join("\n"),
       );
       process.exit(0);
     } else {
@@ -190,15 +211,13 @@ function parseArgs(argv) {
     }
   }
   if (!["prefix", "null", "skip"].includes(a.collision)) {
-    console.error(`--collision must be prefix|null|skip, got ${a.collision}`);
+    console.error(`--collision must be prefix|null|skip`);
     process.exit(2);
   }
   return a;
 }
 
 const ARGS = parseArgs(process.argv);
-
-// ---------------------------------------------------------------- helpers
 
 function log(...xs) {
   console.log(...xs);
@@ -207,6 +226,8 @@ function die(msg) {
   console.error("FATAL:", msg);
   process.exit(2);
 }
+
+// ---------------------------------------------------------------- db
 
 const POOLS = {};
 function pool(nodeId) {
@@ -228,6 +249,9 @@ async function q(nodeId, sql, params) {
   return rows;
 }
 
+const bt = (c) => `\`${c}\``; // backtick an identifier
+const btAll = (cs) => cs.map(bt).join(", ");
+
 async function getPk(table) {
   const rows = await q(
     "NODE_MAIN_HUB",
@@ -237,10 +261,7 @@ async function getPk(table) {
     [table],
   );
   if (!rows.length) die(`No PRIMARY KEY on ${table}`);
-  if (rows.length > 1)
-    die(
-      `Composite PK on ${table} — fix-drift only supports single-column PKs; extend getPk().`,
-    );
+  if (rows.length > 1) die(`Composite PK on ${table} — extend getPk().`);
   return rows[0].COLUMN_NAME;
 }
 
@@ -254,28 +275,7 @@ async function getColumns(table) {
   return rows.map((r) => r.COLUMN_NAME);
 }
 
-async function getUniqueIndexes(table) {
-  const rows = await q(
-    "NODE_MAIN_HUB",
-    `SELECT INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX
-     FROM information_schema.STATISTICS
-     WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND Non_unique=0 AND INDEX_NAME<>'PRIMARY'
-     ORDER BY INDEX_NAME, SEQ_IN_INDEX`,
-    [table],
-  );
-  const idx = {};
-  for (const r of rows) {
-    if (!idx[r.INDEX_NAME]) idx[r.INDEX_NAME] = [];
-    idx[r.INDEX_NAME].push(r.COLUMN_NAME);
-  }
-  return idx;
-}
-
 // ---------------------------------------------------------------- set reads
-//
-// For 656k-row tables this materializes the PK set per node; total memory is
-// ~40 MB per table per node at 656k rows, acceptable. Batches of 50k rows per
-// SELECT to stay under any max_allowed_packet.
 
 async function readPkSet(nodeId, table, pkCol) {
   const set = new Set();
@@ -283,8 +283,8 @@ async function readPkSet(nodeId, table, pkCol) {
   let last = null;
   while (true) {
     const sql = last
-      ? `SELECT ${pkCol} FROM ${table} WHERE ${pkCol} > ? ORDER BY ${pkCol} LIMIT ${CHUNK}`
-      : `SELECT ${pkCol} FROM ${table} ORDER BY ${pkCol} LIMIT ${CHUNK}`;
+      ? `SELECT ${bt(pkCol)} FROM ${bt(table)} WHERE ${bt(pkCol)} > ? ORDER BY ${bt(pkCol)} LIMIT ${CHUNK}`
+      : `SELECT ${bt(pkCol)} FROM ${bt(table)} ORDER BY ${bt(pkCol)} LIMIT ${CHUNK}`;
     const rows = await q(nodeId, sql, last ? [last] : []);
     if (!rows.length) break;
     for (const r of rows) set.add(r[pkCol]);
@@ -295,13 +295,12 @@ async function readPkSet(nodeId, table, pkCol) {
 }
 
 async function readUniqueValueMap(nodeId, table, uniqCols) {
-  // Returns Map<compositeKeyString, Set<record_id>> for each unique index that
-  // has all its columns defined. NULLs are skipped: MySQL unique indexes allow
-  // multiple NULLs, so a NULL never collides.
   if (!uniqCols || !uniqCols.length) return null;
-  const cols = uniqCols.join(", ");
   const pk = await getPk(table);
-  const rows = await q(nodeId, `SELECT ${pk} AS _pk, ${cols} FROM ${table}`);
+  const rows = await q(
+    nodeId,
+    `SELECT ${bt(pk)} AS _pk, ${btAll(uniqCols)} FROM ${bt(table)}`,
+  );
   const m = new Map();
   for (const r of rows) {
     const vals = uniqCols.map((c) => r[c]);
@@ -318,35 +317,29 @@ async function readUniqueValueMap(nodeId, table, uniqCols) {
 async function planTable(table, cfg) {
   const pk = await getPk(table);
   const cols = await getColumns(table);
-  const uniqIdx = await getUniqueIndexes(table);
-
   const steps = [];
-  // Cache per-node PK sets and unique maps across this table's steps.
   const nodePkSet = {};
   const nodeUniqMap = {};
 
-  async function ensurePkSet(nodeId) {
-    if (!nodePkSet[nodeId])
-      nodePkSet[nodeId] = await readPkSet(nodeId, table, pk);
-    return nodePkSet[nodeId];
+  async function ensurePkSet(n) {
+    if (!nodePkSet[n]) nodePkSet[n] = await readPkSet(n, table, pk);
+    return nodePkSet[n];
   }
-  async function ensureUniqMap(nodeId) {
-    if (!nodeUniqMap[nodeId]) {
+  async function ensureUniqMap(n) {
+    if (!nodeUniqMap[n]) {
       const pre = cfg.uniquePrecheck || [];
-      nodeUniqMap[nodeId] = pre.length
-        ? await readUniqueValueMap(nodeId, table, pre)
+      nodeUniqMap[n] = pre.length
+        ? await readUniqueValueMap(n, table, pre)
         : null;
     }
-    return nodeUniqMap[nodeId];
+    return nodeUniqMap[n];
   }
 
-  // Content-diff detection runs once per (table, nodeA vs nodeB) pair.
   const contentDiffs = [];
 
   for (const [srcId, dstId] of cfg.insert) {
     const srcSet = await ensurePkSet(srcId);
     const dstSet = await ensurePkSet(dstId);
-
     const missing = [];
     for (const id of srcSet) if (!dstSet.has(id)) missing.push(id);
 
@@ -357,9 +350,7 @@ async function planTable(table, cfg) {
       const srcUniq = await ensureUniqMap(srcId);
       const dstUniq = await ensureUniqMap(dstId);
       if (srcUniq && dstUniq) {
-        // Fetch unique values for the missing rows on src.
-        const missingCols = [pk, ...cfg.uniquePrecheck].join(", ");
-        // Query in chunks to keep IN() reasonable.
+        const missingCols = btAll([pk, ...cfg.uniquePrecheck]);
         const CH = 500;
         const rows = [];
         for (let i = 0; i < missing.length; i += CH) {
@@ -367,29 +358,24 @@ async function planTable(table, cfg) {
           const ph = slice.map(() => "?").join(",");
           const got = await q(
             srcId,
-            `SELECT ${missingCols} FROM ${table} WHERE ${pk} IN (${ph})`,
+            `SELECT ${missingCols} FROM ${bt(table)} WHERE ${bt(pk)} IN (${ph})`,
             slice,
           );
           rows.push(...got);
         }
-
         toInsert = [];
         for (const r of rows) {
           const vals = cfg.uniquePrecheck.map((c) => r[c]);
           if (vals.some((v) => v === null || v === undefined || v === "")) {
-            // NULL/empty in a unique index can't collide — safe to insert.
             toInsert.push(r[pk]);
             continue;
           }
           const key = JSON.stringify(vals);
-          const dstOwners = dstUniq.get(key);
-          const collides =
-            dstOwners && dstOwners.size > 0 && !dstOwners.has(r[pk]);
-          if (collides) {
+          const owners = dstUniq.get(key);
+          const collides = owners && owners.size > 0 && !owners.has(r[pk]);
+          if (collides)
             collisions.push({ pk: r[pk], cols: cfg.uniquePrecheck, vals });
-          } else {
-            toInsert.push(r[pk]);
-          }
+          else toInsert.push(r[pk]);
         }
       }
     }
@@ -406,23 +392,24 @@ async function planTable(table, cfg) {
     });
   }
 
-  // Content-diff report — reads both sides, diffs in Node.
-  // Only do this for tables explicitly listed in TABLE_PLAN with insert steps OR content authority.
-  // We run it for all configured tables with a hub/branch pair when --apply-content or dry-run.
   const allNodes = Object.keys(NODES);
   for (let i = 0; i < allNodes.length; i++) {
     for (let j = i + 1; j < allNodes.length; j++) {
       const nA = allNodes[i],
         nB = allNodes[j];
-      // Only diff pairs where at least one direction is configured (avoids 3x work for leaf-leaf pairs).
       const configured = cfg.insert.some(
         ([s, d]) => (s === nA && d === nB) || (s === nB && d === nA),
       );
       if (!configured) continue;
-      // Skip tables where content diff detection is pointless (no non-PK columns to differ).
       if (cols.length <= 1) continue;
       const diffs = await diffContent(table, pk, cols, nA, nB);
-      if (diffs.length) contentDiffs.push({ nA, nB, diffs });
+      if (diffs.length)
+        contentDiffs.push({
+          nA,
+          nB,
+          diffs,
+          guard: corruptionGuard(cfg, diffs, nA, nB),
+        });
     }
   }
 
@@ -430,27 +417,13 @@ async function planTable(table, cfg) {
 }
 
 async function diffContent(table, pk, cols, nA, nB) {
-  const colsList = cols.join(", ");
-  // For very large tables, hash-compare in SQL via MD5(CONCAT_WS). We still
-  // pull only the diffing PKs. This assumes deterministic collation, which
-  // utf8mb4_general_ci is.
-  const sql = `
-    SELECT a.${pk} AS _pk
-    FROM (
-      SELECT ${pk}, MD5(CONCAT_WS('#', ${cols.map((c) => `IFNULL(CAST(${c} AS CHAR),'∅')`).join(",")})) AS h
-      FROM ${table}
-    ) a
-    JOIN (
-      SELECT ${pk}, MD5(CONCAT_WS('#', ${cols.map((c) => `IFNULL(CAST(${c} AS CHAR),'∅')`).join(",")})) AS h
-      FROM ${table}
-    ) b ON a.${pk}=b.${pk} AND a.h<>b.h
-    LIMIT 1000`;
-
-  // We can't run this cross-node. Fall back to per-node hash dump + local join.
-  const HASH_COLS = `${pk}, MD5(CONCAT_WS('#', ${cols.map((c) => `IFNULL(CAST(${c} AS CHAR),'∅')`).join(",")})) AS _h`;
+  const hashExpr = cols
+    .map((c) => `IFNULL(CAST(${bt(c)} AS CHAR),'\u2205')`)
+    .join(",");
+  const HASH_COLS = `${bt(pk)}, MD5(CONCAT_WS('#', ${hashExpr})) AS _h`;
   const [rowA, rowB] = await Promise.all([
-    q(nA, `SELECT ${HASH_COLS} FROM ${table}`),
-    q(nB, `SELECT ${HASH_COLS} FROM ${table}`),
+    q(nA, `SELECT ${HASH_COLS} FROM ${bt(table)}`),
+    q(nB, `SELECT ${HASH_COLS} FROM ${bt(table)}`),
   ]);
   const mapB = new Map();
   for (const r of rowB) mapB.set(r[pk], r._h);
@@ -461,16 +434,24 @@ async function diffContent(table, pk, cols, nA, nB) {
   }
   if (!diffPks.length) return [];
 
-  // Fetch full rows for the differing PKs on both sides.
   const CH = 500;
   const rowsA = [],
     rowsB = [];
+  const colsList = btAll(cols);
   for (let i = 0; i < diffPks.length; i += CH) {
     const slice = diffPks.slice(i, i + CH);
     const ph = slice.map(() => "?").join(",");
     const [a, b] = await Promise.all([
-      q(nA, `SELECT ${colsList} FROM ${table} WHERE ${pk} IN (${ph})`, slice),
-      q(nB, `SELECT ${colsList} FROM ${table} WHERE ${pk} IN (${ph})`, slice),
+      q(
+        nA,
+        `SELECT ${colsList} FROM ${bt(table)} WHERE ${bt(pk)} IN (${ph})`,
+        slice,
+      ),
+      q(
+        nB,
+        `SELECT ${colsList} FROM ${bt(table)} WHERE ${bt(pk)} IN (${ph})`,
+        slice,
+      ),
     ]);
     rowsA.push(...a);
     rowsB.push(...b);
@@ -486,27 +467,85 @@ async function diffContent(table, pk, cols, nA, nB) {
     if (!b) continue;
     const diffCols = [];
     for (const c of cols) {
-      if (pkVal && c === pk) continue;
+      if (c === pk) continue;
       const av = a[c],
         bv = b[c];
-      const sa = av === null ? "∅" : String(av);
-      const sb = bv === null ? "∅" : String(bv);
+      const sa = av === null ? "\u2205" : String(av);
+      const sb = bv === null ? "\u2205" : String(bv);
       if (sa !== sb) diffCols.push({ col: c, a: av, b: bv });
     }
-    if (diffCols.length) out.push({ pk: pkVal, cols: diffCols });
+    if (diffCols.length) out.push({ pk: pkVal, cols: diffCols, a, b });
   }
   return out;
+}
+
+// ---------------------------------------------------------------- corruption guard
+//
+// Classifies content diffs so --apply-content can refuse unsafe tables.
+//   CLEAN            — no diffs, or none matching bulk/identity patterns
+//   BULK_TIMESTAMP   — >=50% of diffs have one side's updated_at equal to a
+//                      single value that is absent on the other side; the table
+//                      was bulk-rewritten at one instant (corruption signature)
+//   PK_REUSE         — at least one diff has different identityCols on the two
+//                      sides (same record_id, different person/entity)
+//   MIXED            — both of the above
+
+function corruptionGuard(cfg, diffs, nA, nB) {
+  if (!diffs.length) return { kind: "CLEAN" };
+
+  // PK reuse: any diff where identityCols differ
+  const idCols = cfg.identityCols || [];
+  let pkReuse = null;
+  if (idCols.length) {
+    for (const d of diffs) {
+      const idDiff = d.cols.find((c) => idCols.includes(c.col));
+      if (idDiff) {
+        pkReuse = { pk: d.pk, col: idDiff.col, a: idDiff.a, b: idDiff.b };
+        break;
+      }
+    }
+  }
+
+  // Bulk timestamp: count diffs where a side's updated_at is identical across rows
+  let bulk = null;
+  const updDiff = diffs
+    .map((d) => d.cols.find((c) => c.col === "updated_at"))
+    .filter(Boolean);
+  if (updDiff.length >= Math.ceil(diffs.length * 0.5)) {
+    const aVals = updDiff.map((c) => (c.a === null ? null : String(c.a)));
+    const bVals = updDiff.map((c) => (c.b === null ? null : String(c.b)));
+    const tally = (vals) => {
+      const m = new Map();
+      for (const v of vals) if (v !== null) m.set(v, (m.get(v) || 0) + 1);
+      let top = null,
+        n = 0;
+      for (const [k, v] of m)
+        if (v > n) {
+          top = k;
+          n = v;
+        }
+      return { top, n, total: vals.length };
+    };
+    const tA = tally(aVals);
+    const tB = tally(bVals);
+    if (tA.top && tA.n >= Math.ceil(aVals.length * 0.5))
+      bulk = { side: nA, value: tA.top, n: tA.n, total: aVals.length };
+    else if (tB.top && tB.n >= Math.ceil(bVals.length * 0.5))
+      bulk = { side: nB, value: tB.top, n: tB.n, total: bVals.length };
+  }
+
+  if (pkReuse && bulk) return { kind: "MIXED", pkReuse, bulk };
+  if (pkReuse) return { kind: "PK_REUSE", pkReuse };
+  if (bulk) return { kind: "BULK_TIMESTAMP", bulk };
+  return { kind: "CLEAN" };
 }
 
 // ---------------------------------------------------------------- apply
 
 async function applyInsertStep(step) {
   if (!step.toInsert.length) return { inserted: 0 };
-  const cols = step.cols;
-  const colList = cols.join(", ");
-  const placeholders = `(${cols.map(() => "?").join(",")})`;
-
-  // Fetch full rows for the pk list on the source, in batches matching the INSERT batch size.
+  const colList = btAll(step.cols);
+  const placeholders = `(${step.cols.map(() => "?").join(",")})`;
   const BATCH = ARGS.batchSize;
   const conn = await pool(step.to).getConnection();
   let inserted = 0;
@@ -517,13 +556,13 @@ async function applyInsertStep(step) {
       const ph = slice.map(() => "?").join(",");
       const srcRows = await q(
         step.from,
-        `SELECT ${colList} FROM ${step.table} WHERE ${step.pk} IN (${ph})`,
+        `SELECT ${colList} FROM ${bt(step.table)} WHERE ${bt(step.pk)} IN (${ph})`,
         slice,
       );
       if (!srcRows.length) continue;
       const params = [];
-      for (const r of srcRows) for (const c of cols) params.push(r[c]);
-      const sql = `INSERT IGNORE INTO ${step.table} (${colList}) VALUES ${srcRows.map(() => placeholders).join(",")}`;
+      for (const r of srcRows) for (const c of step.cols) params.push(r[c]);
+      const sql = `INSERT IGNORE INTO ${bt(step.table)} (${colList}) VALUES ${srcRows.map(() => placeholders).join(",")}`;
       const [res] = await conn.execute(sql, params);
       inserted += res.affectedRows;
     }
@@ -537,17 +576,8 @@ async function applyInsertStep(step) {
   return { inserted };
 }
 
-async function applyCodeCollisionRenames(table, collisions, pk, mode) {
-  if (!collisions.length) return { renamed: 0 };
-  if (mode === "skip") return { renamed: 0, skipped: collisions.length };
-  // We rename on the *source* branch, so the insert step can proceed.
-  // Get the branch that had the collisions from the step context; callers pass it via argv? No —
-  // we track per (table, from) below; this function is called from the run loop with explicit nodeId.
-  // See runTable().
-  return { renamed: 0 }; // filled by runTable
-}
-
 async function renameCollidingCodes(nodeId, table, pkCol, collisions, mode) {
+  if (!collisions.length || mode === "skip") return { renamed: 0 };
   const conn = await pool(nodeId).getConnection();
   try {
     await conn.beginTransaction();
@@ -555,7 +585,7 @@ async function renameCollidingCodes(nodeId, table, pkCol, collisions, mode) {
     for (const c of collisions) {
       if (mode === "null") {
         const [r] = await conn.execute(
-          `UPDATE ${table} SET ${c.cols[0]}=NULL WHERE ${pkCol}=?`,
+          `UPDATE ${bt(table)} SET ${bt(c.cols[0])}=NULL WHERE ${bt(pkCol)}=?`,
           [c.pk],
         );
         n += r.affectedRows;
@@ -567,7 +597,7 @@ async function renameCollidingCodes(nodeId, table, pkCol, collisions, mode) {
             .replace("_MAIN_HUB", "HUB")
             .replace("_BRANCH_", "BR");
         const [r] = await conn.execute(
-          `UPDATE ${table} SET ${c.cols[0]}=CONCAT(${c.cols[0]}, ?) WHERE ${pkCol}=?`,
+          `UPDATE ${bt(table)} SET ${bt(c.cols[0])}=CONCAT(${bt(c.cols[0])}, ?) WHERE ${bt(pkCol)}=?`,
           [suffix, c.pk],
         );
         n += r.affectedRows;
@@ -584,23 +614,27 @@ async function renameCollidingCodes(nodeId, table, pkCol, collisions, mode) {
 }
 
 async function applyContentDiffs(contentDiffs, cfg) {
-  // Never auto-applies unless (a) --apply-content, (b) authority node configured
-  // for this table. Authority node's row wins; UPDATEs are pushed to the other node(s).
+  const ignore = new Set(cfg.contentDiffIgnoreCols || []);
   const applied = [];
-  for (const { nA, nB, diffs } of contentDiffs) {
+  for (const { nA, nB, diffs, guard } of contentDiffs) {
+    if (guard.kind === "PK_REUSE" || guard.kind === "MIXED") continue;
+    if (guard.kind === "BULK_TIMESTAMP" && !ARGS.forceBulk) continue;
+
     for (const d of diffs) {
       const winner = cfg.contentAuthority;
       if (!winner || (winner !== nA && winner !== nB)) continue;
       const loser = winner === nA ? nB : nA;
-      const winnerRow =
+      const winnerRow = (
         winner === nA
           ? d.cols.map((c) => [c.col, c.a])
-          : d.cols.map((c) => [c.col, c.b]);
-      const setSql = winnerRow.map(([c]) => `${c}=?`).join(", ");
+          : d.cols.map((c) => [c.col, c.b])
+      ).filter(([c]) => !ignore.has(c));
+      if (!winnerRow.length) continue;
+      const setSql = winnerRow.map(([c]) => `${bt(c)}=?`).join(", ");
       const params = winnerRow.map(([, v]) => v);
       params.push(d.pk);
       const [res] = await pool(loser).execute(
-        `UPDATE ${cfg.__table} SET ${setSql} WHERE ${cfg.__pk}=?`,
+        `UPDATE ${bt(cfg.__table)} SET ${setSql} WHERE ${bt(cfg.__pk)}=?`,
         params,
       );
       applied.push({
@@ -618,8 +652,6 @@ async function applyContentDiffs(contentDiffs, cfg) {
 
 function gateBeforeApply(plan) {
   const errors = [];
-
-  // 1. pm2 engine online
   try {
     const out = execSync("pm2 jlist 2>/dev/null", { encoding: "utf8" });
     const arr = JSON.parse(out);
@@ -628,7 +660,6 @@ function gateBeforeApply(plan) {
     else if (eng.pm2_env.status !== "online")
       errors.push(`replica-engine status is ${eng.pm2_env.status}`);
     else if (eng.pm2_env.restart_time > 0) {
-      // We allow restarts but warn; only block if uptime < 10 min.
       const up = (Date.now() - eng.pm2_env.pm_uptime) / 60000;
       if (up < 10)
         errors.push(
@@ -639,28 +670,21 @@ function gateBeforeApply(plan) {
     errors.push(`pm2 check failed: ${e.message}`);
   }
 
-  // 2. Backups fresh — look for backups/ dir with files < 1h old for each plan table
   const bdir = path.join(__dirname, "backups");
-  if (!fs.existsSync(bdir)) {
-    errors.push(`backups dir missing: ${bdir}`);
-  } else {
+  if (!fs.existsSync(bdir)) errors.push(`backups dir missing: ${bdir}`);
+  else {
     const files = fs.readdirSync(bdir).filter((f) => f.endsWith(".sql"));
     const oneHourAgo = Date.now() - 3600_000;
     const fresh = files.filter(
       (f) => fs.statSync(path.join(bdir, f)).mtimeMs > oneHourAgo,
     );
-    const tables = Object.keys(plan);
-    for (const t of tables) {
-      if (!fresh.some((f) => f.includes(t))) {
-        errors.push(`no backup <1h old for table ${t} in ${bdir}`);
-      }
+    for (const t of Object.keys(plan)) {
+      if (!fresh.some((f) => f.includes(t)))
+        errors.push(`no backup <1h old for ${t} in ${bdir}`);
     }
   }
-
   return errors;
 }
-
-// ---------------------------------------------------------------- verify
 
 function postVerify() {
   try {
@@ -668,10 +692,14 @@ function postVerify() {
       encoding: "utf8",
       timeout: 600_000,
     });
-    const resultLine = out.split("\n").find((l) => l.includes("Result:")) || "";
-    const clean = resultLine.includes("all tables in parity");
-    const warnings = out.split("\n").filter((l) => l.includes("WARN"));
-    return { clean, resultLine: resultLine.trim(), warnings };
+    const resultLine = (
+      out.split("\n").find((l) => l.includes("Result:")) || ""
+    ).trim();
+    return {
+      clean: resultLine.includes("all tables in parity"),
+      resultLine,
+      warnings: out.split("\n").filter((l) => l.includes("WARN")),
+    };
   } catch (e) {
     return {
       clean: false,
@@ -685,10 +713,15 @@ function postVerify() {
 
 async function main() {
   log(
-    `fix-drift.js — mode=${ARGS.apply ? "APPLY" : "DRY-RUN"} collision=${ARGS.collision}`,
+    `fix-drift.js — mode=${ARGS.apply ? "APPLY" : "DRY-RUN"} collision=${ARGS.collision} onlySafe=${ARGS.onlySafe}`,
   );
 
-  const tableNames = ARGS.tables || Object.keys(TABLE_PLAN);
+  let tableNames = ARGS.tables || Object.keys(TABLE_PLAN);
+  if (ARGS.onlySafe)
+    tableNames = tableNames.filter(
+      (t) => TABLE_PLAN[t] && TABLE_PLAN[t].safeToAutoApply,
+    );
+
   const plan = {};
 
   for (const table of tableNames) {
@@ -713,21 +746,36 @@ async function main() {
             log(
               `    COLLISION ${c.pk} ${c.cols.join(",")}=${JSON.stringify(c.vals)}`,
             );
-        } else if (s.collisions.length) {
+        } else if (s.collisions.length)
           log(
             `    (${s.collisions.length} collisions; --verbose for full list)`,
           );
-        }
       }
-      for (const { nA, nB, diffs } of p.contentDiffs) {
-        log(`  content diffs ${nA} vs ${nB}: ${diffs.length}`);
-        for (const d of diffs.slice(0, ARGS.verbose ? diffs.length : 5)) {
+      for (const { nA, nB, diffs, guard } of p.contentDiffs) {
+        log(
+          `  content diffs ${nA} vs ${nB}: ${diffs.length}  guard=${guard.kind}`,
+        );
+        if (guard.kind === "BULK_TIMESTAMP" || guard.kind === "MIXED") {
+          const b = guard.bulk;
           log(
-            `    DIFF ${d.pk}: ${d.cols.map((c) => `${c.col}:${JSON.stringify(c.a)}→${JSON.stringify(c.b)}`).join(" ")}`,
+            `    BULK_TIMESTAMP: ${b.n}/${b.total} diffs share updated_at=${b.value} on ${b.side}`,
           );
         }
-        if (diffs.length > 5 && !ARGS.verbose)
-          log(`    (${diffs.length - 5} more; --verbose to show all)`);
+        if (guard.kind === "PK_REUSE" || guard.kind === "MIXED") {
+          const r = guard.pkReuse;
+          log(
+            `    PK_REUSE sample: ${r.pk} ${r.col}: ${JSON.stringify(r.a)} vs ${JSON.stringify(r.b)}`,
+          );
+        }
+        if (guard.kind === "CLEAN") {
+          for (const d of diffs.slice(0, ARGS.verbose ? diffs.length : 5)) {
+            log(
+              `    DIFF ${d.pk}: ${d.cols.map((c) => `${c.col}:${JSON.stringify(c.a)}\u2192${JSON.stringify(c.b)}`).join(" ")}`,
+            );
+          }
+          if (diffs.length > 5 && !ARGS.verbose)
+            log(`    (${diffs.length - 5} more; --verbose to show all)`);
+        }
       }
     } catch (e) {
       log(`  ERROR planning ${table}: ${e.message}`);
@@ -739,60 +787,55 @@ async function main() {
     process.exit(1);
   }
 
-  // Gates
   const gateErrors = gateBeforeApply(plan);
   if (gateErrors.length) {
     for (const e of gateErrors) console.error("GATE:", e);
     die("pre-apply gates failed");
   }
 
-  // Execute row-set inserts in table plan order.
   for (const table of Object.keys(plan)) {
     const cfg = TABLE_PLAN[table];
     const p = plan[table];
     if (!p) continue;
+    if (ARGS.onlySafe && !cfg.safeToAutoApply) {
+      log(`\n--- skip ${table}: not safeToAutoApply ---`);
+      continue;
+    }
     log(`\n--- apply ${table} ---`);
 
-    // 1. Resolve code collisions on the source if any.
     for (const s of p.steps) {
-      if (s.collisions.length) {
-        if (ARGS.collision === "skip") {
-          log(
-            `  ${s.from}->${s.to}: skipping ${s.collisions.length} colliding rows (--collision=skip)`,
-          );
-          continue;
-        }
-        log(
-          `  ${s.from}->${s.to}: renaming ${s.collisions.length} colliding codes on ${s.from} (--collision=${ARGS.collision})`,
-        );
-        const r = await renameCollidingCodes(
+      if (!s.collisions.length) continue;
+      if (ARGS.collision === "skip") {
+        log(`  ${s.from}->${s.to}: skipping ${s.collisions.length} collisions`);
+        continue;
+      }
+      log(
+        `  ${s.from}->${s.to}: renaming ${s.collisions.length} colliding codes on ${s.from} (${ARGS.collision})`,
+      );
+      const r = await renameCollidingCodes(
+        s.from,
+        table,
+        p.pk,
+        s.collisions,
+        ARGS.collision,
+      );
+      log(`    renamed: ${r.renamed}`);
+      const slice = s.collisions.map((c) => c.pk);
+      const CH = 500;
+      for (let i = 0; i < slice.length; i += CH) {
+        const ph = slice
+          .slice(i, i + CH)
+          .map(() => "?")
+          .join(",");
+        const got = await q(
           s.from,
-          table,
-          p.pk,
-          s.collisions,
-          ARGS.collision,
+          `SELECT ${bt(p.pk)} FROM ${bt(table)} WHERE ${bt(p.pk)} IN (${ph})`,
+          slice.slice(i, i + CH),
         );
-        log(`    renamed/updated: ${r.renamed}`);
-        // Re-plan just this step's insert set: fetch the affected rows again.
-        const slice = s.collisions.map((c) => c.pk);
-        const CH = 500;
-        const colsList = p.cols.join(", ");
-        for (let i = 0; i < slice.length; i += CH) {
-          const ph = slice
-            .slice(i, i + CH)
-            .map(() => "?")
-            .join(",");
-          const got = await q(
-            s.from,
-            `SELECT ${p.pk} FROM ${table} WHERE ${p.pk} IN (${ph})`,
-            slice.slice(i, i + CH),
-          );
-          for (const r2 of got) s.toInsert.push(r2[p.pk]);
-        }
+        for (const r2 of got) s.toInsert.push(r2[p.pk]);
       }
     }
 
-    // 2. Insert each step (order preserved from TABLE_PLAN).
     for (const s of p.steps) {
       if (!s.toInsert.length) {
         log(`  ${s.from}->${s.to}: nothing to insert`);
@@ -811,14 +854,20 @@ async function main() {
       }
     }
 
-    // 3. Content diffs (never auto-applied unless --apply-content + authority).
     if (p.contentDiffs.length && ARGS.applyContent) {
       const cfgWithIds = { ...cfg, __table: table, __pk: p.pk };
       const applied = await applyContentDiffs(p.contentDiffs, cfgWithIds);
+      const blocked = p.contentDiffs.filter(
+        (c) => c.guard.kind !== "CLEAN" && c.guard.kind !== "BULK_TIMESTAMP",
+      );
       if (applied.length) log(`  content diffs applied: ${applied.length}`);
       else
         log(
-          `  content diffs present but no authority configured — not applied`,
+          `  content diffs present but no authority configured or guarded — not applied`,
+        );
+      if (blocked.length)
+        log(
+          `  ${blocked.length} node-pair(s) refused due to ${blocked.map((b) => b.guard.kind).join(",")}`,
         );
     } else if (p.contentDiffs.length) {
       log(
@@ -827,7 +876,6 @@ async function main() {
     }
   }
 
-  // Post-verify
   log("\n--- post-apply verify ---");
   const v = postVerify();
   log(v.resultLine);
