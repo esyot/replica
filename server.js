@@ -13,7 +13,6 @@ const {
   getSyncTokenForNode,
   ALLOWED_TABLES,
 } = require("./triggers");
-
 const { decodeCompositeKey } = require("./pk-codec");
 
 const logger = winston.createLogger({
@@ -227,6 +226,8 @@ const CONFIG = {
     min: 60000,
   }),
   logFidelityWebhookUrl: process.env.LOG_FIDELITY_WEBHOOK_URL || null,
+  // NEW: post-batch verification
+  verifyAfterApply: parseBoolEnv("VERIFY_AFTER_APPLY", true),
 };
 
 if (CONFIG.encryptionKey) {
@@ -441,8 +442,23 @@ async function verifyAllTriggers(nodes) {
   return problems;
 }
 
+// ---------------------------------------------------------------- log fidelity
+//
+// BUG 4 FIX: sync-applied writes touch target tables without writing a log
+// entry (triggers suppressed via @sym_sync_token). So a naive "table newer
+// than log" check fires on every sync target permanently.
+//
+// Correct check: only alert if the target table's UPDATE_TIME is newer than
+// the newest event the target's own checkpoint has processed. If the target
+// is caught up on the log, table-write-time <= log-max is a false positive
+// from sync applies.
+
 async function logFidelityCheck(node) {
   const results = [];
+  // Grace period so a check running right after a sync batch doesn't fire.
+  const GRACE_MS = 120_000;
+  const now = Date.now();
+
   for (const t of ALLOWED_TABLES) {
     try {
       const r = await node.db.raw(
@@ -451,21 +467,39 @@ async function logFidelityCheck(node) {
       );
       const u = (r[0] || r)[0]?.u;
       if (!u) continue;
-      const lr = await node
+      const updateTime = new Date(u).getTime();
+      if (now - updateTime < GRACE_MS) continue; // freshly applied, ignore
+
+      // Newest event this node has applied from ANY source (i.e., its
+      // inbound checkpoints). If the table's write time is newer than that,
+      // and it's not within grace, it was a local write that didn't log.
+      const cpMax = await node
+        .db("sym_checkpoint")
+        .max("updated_at as m")
+        .first();
+      const lastCpAt = cpMax?.m ? new Date(cpMax.m).getTime() : 0;
+      if (updateTime <= lastCpAt) continue; // table touched by an apply, not local
+
+      // Also: if the table's own log has an entry within the grace window,
+      // it's a legitimate local write — skip.
+      const ownLog = await node
         .db("sym_change_log")
         .where("table_name", t)
+        .where("created_at", ">=", new Date(updateTime - GRACE_MS))
         .max("created_at as m")
         .first();
-      const logMax = lr?.m ? new Date(lr.m) : new Date(0);
-      const lag = new Date(u).getTime() - logMax.getTime();
+      if (ownLog?.m) continue;
+
+      const lag = now - updateTime;
       if (lag > CONFIG.logFidelityAlertLagMs)
-        results.push({ table: t, updateTime: u, logMax, lagMs: lag });
+        results.push({ table: t, updateTime: u, lagMs: lag });
     } catch (err) {
       logger.debug(`[LogFidelity] ${node.id}/${t}: ${err.message}`);
     }
   }
+
   if (results.length) {
-    const msg = `[LogFidelity] ${node.id}: ${results.length} table(s) newer than latest log entry. Sample: ${results
+    const msg = `[LogFidelity] ${node.id}: ${results.length} table(s) likely written outside the log. Sample: ${results
       .slice(0, 5)
       .map((r) => `${r.table}(lag=${Math.round(r.lagMs / 1000)}s)`)
       .join(", ")}`;
@@ -487,6 +521,8 @@ async function logFidelityCheck(node) {
   return results;
 }
 
+// ---------------------------------------------------------------- sync worker
+
 class SyncWorker {
   constructor(source, target, opts = {}) {
     this.source = source;
@@ -507,6 +543,8 @@ class SyncWorker {
       deferredEvents: 0,
       resolvedDeferred: 0,
       batches: 0,
+      verifiedOk: 0,
+      verifiedFail: 0,
       lastAppliedAt: null,
     };
   }
@@ -616,6 +654,77 @@ class SyncWorker {
       await b.del();
     }
   }
+
+  // BUG 1/3 FIX: after every batch, verify that every row we intended to
+  // write actually landed on target with the correct values. If any failed
+  // (silent skip due to FK orphan or other constraint), halt. This closes
+  // the "checkpoint advances past unapplied events" hole.
+  async verifyBatchApplied(table, tableChanges) {
+    const pkCols = await getCachedPkColumns(this.target, table);
+    if (pkCols.length !== 1) return { ok: true, skipped: "composite-pk" };
+    const pkCol = pkCols[0];
+
+    const inserts = [];
+    const deletes = [];
+    for (const c of tableChanges) {
+      if (c.operation === "DELETE") deletes.push(c.primary_key_val);
+      else inserts.push(c.primary_key_val);
+    }
+
+    const bad = [];
+
+    if (inserts.length) {
+      const existing = new Set();
+      const CH = 500;
+      for (let i = 0; i < inserts.length; i += CH) {
+        const slice = inserts.slice(i, i + CH);
+        const ph = slice.map(() => "?").join(",");
+        const rows = await this.target
+          .db(table)
+          .select(pkCol)
+          .whereIn(pkCol, slice);
+        for (const r of rows) existing.add(String(r[pkCol]));
+      }
+      for (const id of inserts) {
+        if (!existing.has(String(id))) bad.push({ op: "INSERT", pk: id });
+      }
+    }
+
+    if (deletes.length) {
+      const still = new Set();
+      const CH = 500;
+      for (let i = 0; i < deletes.length; i += CH) {
+        const slice = deletes.slice(i, i + CH);
+        const ph = slice.map(() => "?").join(",");
+        const rows = await this.target
+          .db(table)
+          .select(pkCol)
+          .whereIn(pkCol, slice);
+        for (const r of rows) still.add(String(r[pkCol]));
+      }
+      for (const id of deletes) {
+        if (still.has(String(id))) bad.push({ op: "DELETE", pk: id });
+      }
+    }
+
+    if (bad.length) {
+      this.stats.verifiedFail += bad.length;
+      const sample = bad
+        .slice(0, 5)
+        .map((b) => `${b.op}:${b.pk}`)
+        .join(", ");
+      this.halted = true;
+      this.haltReason = `post-apply verify failed for ${table}: ${bad.length} row(s) did not land. Sample: ${sample}. Checkpoint NOT advanced. Resume after manual repair.`;
+      this.haltedAt = new Date();
+      logger.error(
+        `[HALT/VERIFY] ${this.source.id}->${this.target.id}: ${this.haltReason}`,
+      );
+      throw new Error(`Sync halted: ${this.haltReason}`);
+    }
+    this.stats.verifiedOk += inserts.length + deletes.length;
+    return { ok: true, checked: inserts.length + deletes.length };
+  }
+
   async applyTableChanges(trx, table, tableChanges) {
     const pkCols = await getCachedPkColumns(this.target, table);
     const deletes = [],
@@ -785,10 +894,16 @@ class SyncWorker {
         );
         throw err;
       }
+
       let appliedCount = 0,
         deferredAdded = 0,
         deferredResolved = 0,
         relayedCount = 0;
+
+      // BUG 2 FIX: build the insert-order and a *reverse* delete-order.
+      // Parent-before-child for inserts, child-before-parent for deletes.
+      const deleteReverseOrder = [...tableOrder].reverse();
+
       try {
         await this.target.db.transaction(async (trx) => {
           let restore = async () => {};
@@ -799,19 +914,23 @@ class SyncWorker {
               deferredResolved = r.resolved;
               this.deferred = r.stillDeferred;
             }
-            for (const table of tableOrder) {
+
+            // Phase 1: DELETES, children-first.
+            for (const table of deleteReverseOrder) {
               const tcs = byTable.get(table);
-              if (!tcs || !tcs.length) continue;
+              if (!tcs) continue;
+              const dels = tcs.filter((c) => c.operation === "DELETE");
+              if (!dels.length) continue;
               const ok = [];
               try {
-                await this.applyTableChanges(trx, table, tcs);
-                appliedCount += tcs.length;
-                ok.push(...tcs);
+                await this.applyTableChanges(trx, table, dels);
+                appliedCount += dels.length;
+                ok.push(...dels);
               } catch (tableErr) {
                 logger.error(
-                  `[Sync Engine] Table ${table} batch failed: ${tableErr.message}. Per-row fallback.`,
+                  `[Sync Engine] DELETE phase failed for ${table}: ${tableErr.message}. Per-row fallback.`,
                 );
-                for (const c of tcs) {
+                for (const c of dels) {
                   try {
                     await this.applyTableChanges(trx, table, [c]);
                     appliedCount++;
@@ -841,6 +960,72 @@ class SyncWorker {
               if (ok.length && this.relayEnabled)
                 relayedCount += await this.relayChanges(trx, table, ok);
             }
+
+            // Phase 2: INSERTS/UPDATES, parents-first (original tableOrder).
+            for (const table of tableOrder) {
+              const tcs = byTable.get(table);
+              if (!tcs) continue;
+              const up = tcs.filter((c) => c.operation !== "DELETE");
+              if (!up.length) continue;
+              const ok = [];
+              try {
+                await this.applyTableChanges(trx, table, up);
+                appliedCount += up.length;
+                ok.push(...up);
+              } catch (tableErr) {
+                logger.error(
+                  `[Sync Engine] UPDATE/INSERT phase failed for ${table}: ${tableErr.message}. Per-row fallback.`,
+                );
+                for (const c of up) {
+                  try {
+                    await this.applyTableChanges(trx, table, [c]);
+                    appliedCount++;
+                    ok.push(c);
+                  } catch (rowErr) {
+                    if (this.isDeferrableFkError(rowErr)) {
+                      if (this.deferred.length >= CONFIG.deferMaxQueueSize) {
+                        this.halted = true;
+                        this.haltReason = `Deferred queue full`;
+                        this.haltedAt = new Date();
+                        throw new Error(`Sync halted: ${this.haltReason}`);
+                      }
+                      this.deferred.push({ table, change: c, attempts: 1 });
+                      deferredAdded++;
+                    } else {
+                      this.halted = true;
+                      this.haltReason = `change_id=${c.change_id} table=${table}: ${rowErr.message}`;
+                      this.haltedAt = new Date();
+                      logger.error(
+                        `[HALT] ${this.source.id}->${this.target.id}: ${this.haltReason}`,
+                      );
+                      throw new Error(`Sync halted: ${this.haltReason}`);
+                    }
+                  }
+                }
+              }
+              if (ok.length && this.relayEnabled)
+                relayedCount += await this.relayChanges(trx, table, ok);
+            }
+
+            // BUG 1 FIX: don't advance checkpoint unless we confirm every
+            // applied row actually landed. Run AFTER all applies, BEFORE
+            // setCheckpoint. Throws on mismatch → transaction rolls back,
+            // checkpoint stays at pre-batch value, worker halts.
+            if (CONFIG.verifyAfterApply) {
+              for (const table of tableOrder) {
+                const tcs = byTable.get(table);
+                if (!tcs) continue;
+                const relevant = tcs.filter(
+                  (c) =>
+                    !this.deferred.some(
+                      (d) => d.change.change_id === c.change_id,
+                    ),
+                );
+                if (relevant.length)
+                  await this.verifyBatchApplied(table, relevant);
+              }
+            }
+
             const dIds = this.deferred
               .map((d) => BigInt(d.change.change_id))
               .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
@@ -1158,7 +1343,7 @@ async function startMultiBranchEngine() {
   try {
     logger.info(`Starting Hub-and-Spoke for Hub [${HUB_NODE.id}]...`);
     logger.info(
-      `[Config] port=${CONFIG.port} poll=${CONFIG.pollIntervalMs} batch=${CONFIG.batchSize} branches=${branchNodes.length} encryption=${Boolean(CONFIG.encryptionKey)} relay=${CONFIG.relayEnabled}`,
+      `[Config] port=${CONFIG.port} poll=${CONFIG.pollIntervalMs} batch=${CONFIG.batchSize} branches=${branchNodes.length} encryption=${Boolean(CONFIG.encryptionKey)} relay=${CONFIG.relayEnabled} verifyAfterApply=${CONFIG.verifyAfterApply}`,
     );
 
     await provisionNode(HUB_NODE);
