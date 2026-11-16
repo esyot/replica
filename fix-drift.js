@@ -56,6 +56,22 @@ const BRANCH_CONNS = JSON.parse(ENV.BRANCHES_JSON || "[]").map((b) => ({
 const NODES = { [HUB_CONN.id]: HUB_CONN.cfg };
 for (const b of BRANCH_CONNS) NODES[b.id] = b.cfg;
 
+// ---------------------------------------------------------------- sync tokens
+//
+// Each node's trigger only logs when @sym_sync_token is NULL or != that node's
+// token. When we write to a node, we set its token first so the trigger skips
+// logging — otherwise the change gets shipped to the other nodes and bounces
+// back, creating duplicate sym_change_log entries and potential re-corruption.
+
+const SYNC_TOKENS = {
+  NODE_MAIN_HUB: ENV.SYNC_TOKEN_MAIN_HUB,
+  NODE_BRANCH_02: ENV.SYNC_TOKEN_BRANCH_02,
+  NODE_BRANCH_03: ENV.SYNC_TOKEN_BRANCH_03,
+};
+for (const id of Object.keys(NODES)) {
+  if (!SYNC_TOKENS[id]) die(`Missing SYNC_TOKEN for ${id} in .env`);
+}
+
 // ---------------------------------------------------------------- table plan
 
 const TABLE_PLAN = {
@@ -69,7 +85,7 @@ const TABLE_PLAN = {
     identityCols: ["name"],
     contentDiffIgnoreCols: ["address"],
     contentAuthority: null,
-    safeToAutoApply: false, // blocked on BR02 corruption root-cause
+    safeToAutoApply: false, // PK_REUSE guard + duplicate-code collisions
   },
   repa_deposit: {
     insert: [
@@ -114,7 +130,7 @@ const TABLE_PLAN = {
     identityCols: ["customer"],
     contentDiffIgnoreCols: ["customer", "date_ordered"],
     contentAuthority: null,
-    safeToAutoApply: false, // blocked on BR02 corruption root-cause
+    safeToAutoApply: false, // PK_REUSE guard + FK to customer
   },
   sales_order_details: {
     insert: [
@@ -125,7 +141,7 @@ const TABLE_PLAN = {
     identityCols: [],
     contentDiffIgnoreCols: [],
     contentAuthority: null,
-    safeToAutoApply: false, // FK on sales_order
+    safeToAutoApply: false, // FK to sales_order
   },
   sales_payment: {
     insert: [
@@ -136,7 +152,7 @@ const TABLE_PLAN = {
     identityCols: [],
     contentDiffIgnoreCols: [],
     contentAuthority: null,
-    safeToAutoApply: false, // FK on sales_order
+    safeToAutoApply: false, // FK to sales_order
   },
   deposit: {
     insert: [],
@@ -249,7 +265,18 @@ async function q(nodeId, sql, params) {
   return rows;
 }
 
-const bt = (c) => `\`${c}\``; // backtick an identifier
+/**
+ * Set @sym_sync_token on a dedicated connection. Must be called on the SAME
+ * connection that will execute the write, because the session variable is
+ * connection-scoped.
+ */
+async function setToken(conn, nodeId) {
+  const token = SYNC_TOKENS[nodeId];
+  if (!token) die(`No sync token for ${nodeId}`);
+  await conn.query("SET @sym_sync_token = ?", [token]);
+}
+
+const bt = (c) => `\`${c}\``;
 const btAll = (cs) => cs.map(bt).join(", ");
 
 async function getPk(table) {
@@ -480,20 +507,10 @@ async function diffContent(table, pk, cols, nA, nB) {
 }
 
 // ---------------------------------------------------------------- corruption guard
-//
-// Classifies content diffs so --apply-content can refuse unsafe tables.
-//   CLEAN            — no diffs, or none matching bulk/identity patterns
-//   BULK_TIMESTAMP   — >=50% of diffs have one side's updated_at equal to a
-//                      single value that is absent on the other side; the table
-//                      was bulk-rewritten at one instant (corruption signature)
-//   PK_REUSE         — at least one diff has different identityCols on the two
-//                      sides (same record_id, different person/entity)
-//   MIXED            — both of the above
 
 function corruptionGuard(cfg, diffs, nA, nB) {
   if (!diffs.length) return { kind: "CLEAN" };
 
-  // PK reuse: any diff where identityCols differ
   const idCols = cfg.identityCols || [];
   let pkReuse = null;
   if (idCols.length) {
@@ -506,7 +523,6 @@ function corruptionGuard(cfg, diffs, nA, nB) {
     }
   }
 
-  // Bulk timestamp: count diffs where a side's updated_at is identical across rows
   let bulk = null;
   const updDiff = diffs
     .map((d) => d.cols.find((c) => c.col === "updated_at"))
@@ -550,6 +566,9 @@ async function applyInsertStep(step) {
   const conn = await pool(step.to).getConnection();
   let inserted = 0;
   try {
+    // Suppress trigger logging on the destination node. Must be on the
+    // same connection as the INSERT because @sym_sync_token is session-scoped.
+    await setToken(conn, step.to);
     await conn.beginTransaction();
     for (let i = 0; i < step.toInsert.length; i += BATCH) {
       const slice = step.toInsert.slice(i, i + BATCH);
@@ -580,6 +599,7 @@ async function renameCollidingCodes(nodeId, table, pkCol, collisions, mode) {
   if (!collisions.length || mode === "skip") return { renamed: 0 };
   const conn = await pool(nodeId).getConnection();
   try {
+    await setToken(conn, nodeId);
     await conn.beginTransaction();
     let n = 0;
     for (const c of collisions) {
@@ -633,16 +653,23 @@ async function applyContentDiffs(contentDiffs, cfg) {
       const setSql = winnerRow.map(([c]) => `${bt(c)}=?`).join(", ");
       const params = winnerRow.map(([, v]) => v);
       params.push(d.pk);
-      const [res] = await pool(loser).execute(
-        `UPDATE ${bt(cfg.__table)} SET ${setSql} WHERE ${bt(cfg.__pk)}=?`,
-        params,
-      );
-      applied.push({
-        table: cfg.__table,
-        pk: d.pk,
-        loser,
-        affected: res.affectedRows,
-      });
+
+      const conn = await pool(loser).getConnection();
+      try {
+        await setToken(conn, loser);
+        const [res] = await conn.execute(
+          `UPDATE ${bt(cfg.__table)} SET ${setSql} WHERE ${bt(cfg.__pk)}=?`,
+          params,
+        );
+        applied.push({
+          table: cfg.__table,
+          pk: d.pk,
+          loser,
+          affected: res.affectedRows,
+        });
+      } finally {
+        conn.release();
+      }
     }
   }
   return applied;
