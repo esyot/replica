@@ -226,7 +226,7 @@ const CONFIG = {
     min: 60000,
   }),
   logFidelityWebhookUrl: process.env.LOG_FIDELITY_WEBHOOK_URL || null,
-  // NEW: post-batch verification
+  // post-batch verification
   verifyAfterApply: parseBoolEnv("VERIFY_AFTER_APPLY", true),
 };
 
@@ -444,9 +444,9 @@ async function verifyAllTriggers(nodes) {
 
 // ---------------------------------------------------------------- log fidelity
 //
-// BUG 4 FIX: sync-applied writes touch target tables without writing a log
-// entry (triggers suppressed via @sym_sync_token). So a naive "table newer
-// than log" check fires on every sync target permanently.
+// Sync-applied writes touch target tables without writing a log entry
+// (triggers suppressed via @sym_sync_token). So a naive "table newer than log"
+// check fires on every sync target permanently.
 //
 // Correct check: only alert if the target table's UPDATE_TIME is newer than
 // the newest event the target's own checkpoint has processed. If the target
@@ -655,11 +655,17 @@ class SyncWorker {
     }
   }
 
-  // BUG 1/3 FIX: after every batch, verify that every row we intended to
-  // write actually landed on target with the correct values. If any failed
-  // (silent skip due to FK orphan or other constraint), halt. This closes
-  // the "checkpoint advances past unapplied events" hole.
-  async verifyBatchApplied(table, tableChanges) {
+  // After every batch, verify that every row we intended to write actually
+  // landed on target. If any failed (silent skip due to FK orphan or other
+  // constraint), halt. This closes the "checkpoint advances past unapplied
+  // events" hole.
+  //
+  // FIX B: this now takes the batch's transaction (`trx`) and queries through
+  // it. Previously it queried `this.target.db`, which uses a different pooled
+  // connection and cannot see the batch's own uncommitted writes — so every
+  // DELETE looked like it "did not land" and every new INSERT looked missing,
+  // halting the worker on the first batch containing either.
+  async verifyBatchApplied(trx, table, tableChanges) {
     const pkCols = await getCachedPkColumns(this.target, table);
     if (pkCols.length !== 1) return { ok: true, skipped: "composite-pk" };
     const pkCol = pkCols[0];
@@ -672,17 +678,13 @@ class SyncWorker {
     }
 
     const bad = [];
+    const CH = 500;
 
     if (inserts.length) {
       const existing = new Set();
-      const CH = 500;
       for (let i = 0; i < inserts.length; i += CH) {
         const slice = inserts.slice(i, i + CH);
-        const ph = slice.map(() => "?").join(",");
-        const rows = await this.target
-          .db(table)
-          .select(pkCol)
-          .whereIn(pkCol, slice);
+        const rows = await trx(table).select(pkCol).whereIn(pkCol, slice);
         for (const r of rows) existing.add(String(r[pkCol]));
       }
       for (const id of inserts) {
@@ -692,14 +694,9 @@ class SyncWorker {
 
     if (deletes.length) {
       const still = new Set();
-      const CH = 500;
       for (let i = 0; i < deletes.length; i += CH) {
         const slice = deletes.slice(i, i + CH);
-        const ph = slice.map(() => "?").join(",");
-        const rows = await this.target
-          .db(table)
-          .select(pkCol)
-          .whereIn(pkCol, slice);
+        const rows = await trx(table).select(pkCol).whereIn(pkCol, slice);
         for (const r of rows) still.add(String(r[pkCol]));
       }
       for (const id of deletes) {
@@ -857,15 +854,29 @@ class SyncWorker {
       const byTable = new Map();
       let valid = 0,
         skipped = 0;
+
+      // FIX A: collapse to the latest event per (table, PK).
+      // `changes` is ordered by change_id ASC, so a later event overwrites an
+      // earlier one. row_data holds a full-row snapshot, so last-writer-wins
+      // is correct. Without this, a DELETE + INSERT (or INSERT + DELETE) of the
+      // same PK in one batch gets applied as "all deletes first, then all
+      // upserts", which can resurrect a deleted row or contradict the verify.
+      // `lastBatchId` below is still taken from the full `changes` list, so
+      // the checkpoint advance is unaffected.
+      const latest = new Map();
       for (const c of changes) {
         if (!ALLOWED_TABLES.has(c.table_name)) {
           skipped++;
           continue;
         }
+        latest.set(`${c.table_name}\u0000${c.primary_key_val}`, c);
+      }
+      for (const c of latest.values()) {
         if (!byTable.has(c.table_name)) byTable.set(c.table_name, []);
         byTable.get(c.table_name).push(c);
         valid++;
       }
+
       if (skipped) {
         this.stats.skippedEvents += skipped;
         logger.warn(
@@ -900,8 +911,8 @@ class SyncWorker {
         deferredResolved = 0,
         relayedCount = 0;
 
-      // BUG 2 FIX: build the insert-order and a *reverse* delete-order.
-      // Parent-before-child for inserts, child-before-parent for deletes.
+      // Insert-order is parent-before-child; delete-order is the reverse
+      // (child-before-parent).
       const deleteReverseOrder = [...tableOrder].reverse();
 
       try {
@@ -1007,10 +1018,11 @@ class SyncWorker {
                 relayedCount += await this.relayChanges(trx, table, ok);
             }
 
-            // BUG 1 FIX: don't advance checkpoint unless we confirm every
-            // applied row actually landed. Run AFTER all applies, BEFORE
-            // setCheckpoint. Throws on mismatch → transaction rolls back,
-            // checkpoint stays at pre-batch value, worker halts.
+            // Don't advance the checkpoint unless every applied row actually
+            // landed. Runs AFTER all applies, BEFORE setCheckpoint. Throws on
+            // mismatch → transaction rolls back, checkpoint stays at its
+            // pre-batch value, worker halts.
+            // FIX B: pass `trx` so the verify sees this batch's own writes.
             if (CONFIG.verifyAfterApply) {
               for (const table of tableOrder) {
                 const tcs = byTable.get(table);
@@ -1022,7 +1034,7 @@ class SyncWorker {
                     ),
                 );
                 if (relevant.length)
-                  await this.verifyBatchApplied(table, relevant);
+                  await this.verifyBatchApplied(trx, table, relevant);
               }
             }
 
